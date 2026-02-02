@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m playwright:*)",
+      "Bash(pip install:*)",
+      "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(taskkill:*)",
+      "Bash(curl -s \"https://api.telegram.org/bot8233910065:AAGFhbC1KT1PDIQmRkIQ8MzjuIzk65Gsrso/deleteWebhook?drop_pending_updates=true\")"
+    ]
+  }
+}

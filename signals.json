@@ -1,0 +1,23 @@
+[
+  {
+    "address": "HnEn97trkGxo1qDbgm1BxA2TuaUC541KKhyfPEAnpump",
+    "symbol": "cap",
+    "name": "cap",
+    "price": 1.402e-05,
+    "mc": 13952.0,
+    "liquidity": 10078.94,
+    "buys_5m": 34,
+    "sells_5m": 28,
+    "vol_5m": 2262.97,
+    "vol_1h": 108327.54,
+    "change_5m": 21.77,
+    "change_1h": -66.27,
+    "trade_type": "QUICK",
+    "signal": "BUY",
+    "reason": "+22% 5m",
+    "score": 50,
+    "target": 8,
+    "chart": "https://dexscreener.com/solana/HnEn97trkGxo1qDbgm1BxA2TuaUC541KKhyfPEAnpump",
+    "timestamp": "2026-02-02T02:09:55.876999"
+  }
+]
