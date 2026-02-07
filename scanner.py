@@ -1,19 +1,28 @@
 """
-Token Scanner - 3 Trade Types
+Token Scanner - 4 Trade Types
 
 TYPE 1: QUICK - Low MC fast trades
-  - MC: 10K-35K
+  - MC: 20K-120K
   - Target: 8%+
   - Fast in/out
 
 TYPE 2: MOMENTUM - High MC momentum plays
-  - MC: 75K-135K
+  - MC: 100K-500K
   - Target: 25-30%
   - Starting momentum, high volume
 
 TYPE 3: GEM - Runner finder
+  - MC: <800K
   - Key signals of a runner
   - Big potential
+
+TYPE 4: RANGE - Mature token range plays (NEW)
+  - Age: 24h+
+  - MC: 50K-2M
+  - Buy near 24h low (support)
+  - 3-step DCA: 15/25/60%
+  - Target: 15-25%
+  - Calmer, more predictable
 """
 
 import asyncio
@@ -85,19 +94,25 @@ class TokenSignal:
         return f"${self.mc/1000:.0f}K"
 
 
-# Trade type configs
-QUICK_MC_MIN = 10_000
-QUICK_MC_MAX = 35_000
+# Trade type configs - EXPANDED RANGES
+QUICK_MC_MIN = 20_000      # Lower floor to catch earlier
+QUICK_MC_MAX = 120_000     # Expanded from 80K
 QUICK_TARGET = 8
 
-MOMENTUM_MC_MIN = 75_000
-MOMENTUM_MC_MAX = 135_000
+MOMENTUM_MC_MIN = 100_000  # Overlap slightly with QUICK
+MOMENTUM_MC_MAX = 500_000  # Much higher - bigger plays
 MOMENTUM_TARGET = 25
 
-GEM_MC_MAX = 50_000  # Gems found early
+GEM_MC_MAX = 800_000       # Can find gems at higher MC too
 GEM_TARGET = 100
 
-MIN_LIQUIDITY = 5_000
+# RANGE trade - mature tokens (24h+)
+RANGE_MC_MIN = 50_000      # Established tokens
+RANGE_MC_MAX = 2_000_000   # Up to 2M MC
+RANGE_TARGET = 20          # More conservative target
+RANGE_MIN_AGE_HOURS = 24   # Must be 24h+ old
+
+MIN_LIQUIDITY = 12_000     # Slightly lower for more options
 
 
 async def fetch_json(url: str, session: aiohttp.ClientSession, timeout: int = 12) -> Optional[dict]:
@@ -182,11 +197,27 @@ def extract_pair_data(pair: dict) -> Optional[dict]:
         volume = pair.get("volume", {})
         price_change = pair.get("priceChange", {})
 
+        # Get 24h high/low for range detection
+        price = float(pair.get("priceUsd", 0) or 0)
+        change_24h = float(price_change.get("h24", 0) or 0)
+
+        # Estimate 24h high/low from current price and 24h change
+        # If +50% in 24h, price was ~66% of current 24h ago
+        # If -50% in 24h, price was 200% of current 24h ago
+        if change_24h != 0 and price > 0:
+            price_24h_ago = price / (1 + change_24h / 100)
+            # Rough estimate: high = max(current, 24h_ago * 1.1), low = min(current, 24h_ago * 0.9)
+            high_24h = max(price, price_24h_ago) * 1.05  # Add 5% buffer
+            low_24h = min(price, price_24h_ago) * 0.95   # Subtract 5% buffer
+        else:
+            high_24h = price
+            low_24h = price
+
         return {
             "address": address,
             "symbol": base.get("symbol", "?")[:12],
             "name": base.get("name", "?")[:25],
-            "price": float(pair.get("priceUsd", 0) or 0),
+            "price": price,
             "mc": float(pair.get("marketCap", 0) or 0),
             "liquidity": float(pair.get("liquidity", {}).get("usd", 0) or 0),
             "buys_5m": int(txns.get("m5", {}).get("buys", 0) or 0),
@@ -195,10 +226,13 @@ def extract_pair_data(pair: dict) -> Optional[dict]:
             "sells_1h": int(txns.get("h1", {}).get("sells", 0) or 0),
             "vol_5m": float(volume.get("m5", 0) or 0),
             "vol_1h": float(volume.get("h1", 0) or 0),
+            "vol_24h": float(volume.get("h24", 0) or 0),
             "change_5m": float(price_change.get("m5", 0) or 0),
             "change_1h": float(price_change.get("h1", 0) or 0),
             "change_6h": float(price_change.get("h6", 0) or 0),
-            "change_24h": float(price_change.get("h24", 0) or 0),
+            "change_24h": change_24h,
+            "high_24h": high_24h,
+            "low_24h": low_24h,
             "created": pair.get("pairCreatedAt", 0),
             "chart": f"https://dexscreener.com/solana/{address}"
         }
@@ -225,6 +259,8 @@ def evaluate_quick(data: dict) -> Optional[TokenSignal]:
         return None  # Skip if selling
 
     buy_ratio = data["buys_5m"] / max(1, data["sells_5m"])
+    if buy_ratio < 1.3:
+        return None  # Too weak buy pressure for QUICK
 
     # Strong buy pressure
     if buy_ratio >= 2.0:
@@ -298,14 +334,14 @@ def evaluate_momentum(data: dict) -> Optional[TokenSignal]:
     if not (MOMENTUM_MC_MIN <= mc <= MOMENTUM_MC_MAX):
         return None
 
-    if data["liquidity"] < MIN_LIQUIDITY * 2:  # Higher liq requirement
+    if data["liquidity"] < MIN_LIQUIDITY * 1.5:  # Relaxed liq requirement
         return None
 
     score = 0
     reasons = []
 
-    # Need high volume
-    if data["vol_1h"] < 10000:
+    # Need decent volume (lowered)
+    if data["vol_1h"] < 5000:
         return None  # Skip low volume
 
     reasons.append(f"${data['vol_1h']/1000:.0f}K vol")
@@ -315,7 +351,7 @@ def evaluate_momentum(data: dict) -> Optional[TokenSignal]:
     buy_ratio_5m = data["buys_5m"] / max(1, data["sells_5m"])
     buy_ratio_1h = data["buys_1h"] / max(1, data["sells_1h"])
 
-    if buy_ratio_5m < 1.0:
+    if buy_ratio_5m < 1.2:
         return None  # Skip if current selling
 
     # Starting momentum - 5m stronger than 1h
@@ -327,7 +363,7 @@ def evaluate_momentum(data: dict) -> Optional[TokenSignal]:
     if buy_ratio_5m >= 2.0:
         score += 20
         reasons.append(f"buy {buy_ratio_5m:.1f}x")
-    elif buy_ratio_5m >= 1.5:
+    elif buy_ratio_5m >= 1.7:
         score += 10
 
     # Price recovering or pushing
@@ -406,7 +442,7 @@ def evaluate_gem(data: dict) -> Optional[TokenSignal]:
     buy_ratio_5m = data["buys_5m"] / max(1, data["sells_5m"])
     buy_ratio_1h = data["buys_1h"] / max(1, data["sells_1h"])
 
-    if buy_ratio_5m >= 1.5 and buy_ratio_1h >= 1.3:
+    if buy_ratio_5m >= 1.7 and buy_ratio_1h >= 1.3:
         gem_signals += 1
         score += 20
         reasons.append("consistent buying")
@@ -434,12 +470,12 @@ def evaluate_gem(data: dict) -> Optional[TokenSignal]:
             reasons.append(f"{liq_ratio*100:.0f}% liq")
 
     # Need multiple gem signals
-    if gem_signals < 2:
+    if gem_signals < 3:
         return None
 
     reasons.insert(0, f"{gem_signals} signals")
 
-    signal = "BUY" if gem_signals >= 2 and score >= 40 else "WATCH" if gem_signals >= 2 else "SKIP"
+    signal = "BUY" if gem_signals >= 3 and score >= 40 else "WATCH" if gem_signals >= 3 else "SKIP"
 
     return TokenSignal(
         address=data["address"],
@@ -468,8 +504,121 @@ def evaluate_gem(data: dict) -> Optional[TokenSignal]:
     )
 
 
+def evaluate_range(data: dict) -> Optional[TokenSignal]:
+    """TYPE 4: RANGE - Mature token range plays. Buy near support."""
+    mc = data["mc"]
+
+    # MC must be in range
+    if not (RANGE_MC_MIN <= mc <= RANGE_MC_MAX):
+        return None
+
+    # Higher liquidity requirement for range trades
+    if data["liquidity"] < MIN_LIQUIDITY * 2:
+        return None
+
+    # Must be 24h+ old (mature token)
+    age_mins = 9999
+    if data["created"]:
+        age_mins = int((datetime.now().timestamp() * 1000 - data["created"]) / (1000 * 60))
+
+    age_hours = age_mins / 60
+    if age_hours < RANGE_MIN_AGE_HOURS:
+        return None  # Too young for range trading
+
+    score = 0
+    reasons = []
+
+    # ===== RANGE DETECTION =====
+    price = data["price"]
+    high_24h = data.get("high_24h", price)
+    low_24h = data.get("low_24h", price)
+
+    if high_24h <= low_24h or price <= 0:
+        return None
+
+    # Calculate position in range (0 = at low, 1 = at high)
+    range_size = high_24h - low_24h
+    if range_size > 0:
+        position_in_range = (price - low_24h) / range_size
+    else:
+        position_in_range = 0.5
+
+    # RANGE SIGNAL 1: Near support (lower 30% of range)
+    if position_in_range <= 0.30:
+        score += 35
+        reasons.append(f"near support ({position_in_range*100:.0f}%)")
+    elif position_in_range <= 0.45:
+        score += 20
+        reasons.append(f"mid-low range ({position_in_range*100:.0f}%)")
+    else:
+        return None  # Don't buy at resistance or mid/high range
+
+    # RANGE SIGNAL 2: Bouncing (5m positive after dip)
+    if data["change_5m"] > 0 and data["change_1h"] < 0:
+        score += 25
+        reasons.append("bounce forming")
+    elif data["change_5m"] > 2:
+        score += 15
+        reasons.append(f"+{data['change_5m']:.0f}% 5m")
+
+    # RANGE SIGNAL 3: Buy pressure returning
+    buy_ratio_5m = data["buys_5m"] / max(1, data["sells_5m"])
+    if buy_ratio_5m >= 1.5:
+        score += 20
+        reasons.append(f"{buy_ratio_5m:.1f}x buy")
+    elif buy_ratio_5m >= 1.2:
+        score += 10
+
+    # RANGE SIGNAL 4: Decent volume (not dead)
+    if data["vol_24h"] > 50000:
+        score += 15
+        reasons.append(f"${data['vol_24h']/1000:.0f}K 24h vol")
+    elif data["vol_1h"] > 2000:
+        score += 10
+
+    # RANGE SIGNAL 5: Not crashed (24h change reasonable)
+    if -30 <= data["change_24h"] <= 30:
+        score += 10
+        reasons.append("stable")
+    elif data["change_24h"] < -50:
+        score -= 20  # Penalize crashed tokens
+
+    # Liquidity health
+    if mc > 0 and data["liquidity"] / mc > 0.15:
+        score += 10
+        reasons.append("good liq")
+
+    signal = "BUY" if score >= 50 else "WATCH" if score >= 35 else "SKIP"
+
+    return TokenSignal(
+        address=data["address"],
+        symbol=data["symbol"],
+        name=data["name"],
+        price=data["price"],
+        mc=mc,
+        liquidity=data["liquidity"],
+        buys_5m=data["buys_5m"],
+        sells_5m=data["sells_5m"],
+        buys_1h=data["buys_1h"],
+        sells_1h=data["sells_1h"],
+        vol_5m=data["vol_5m"],
+        vol_1h=data["vol_1h"],
+        change_5m=data["change_5m"],
+        change_1h=data["change_1h"],
+        change_6h=data["change_6h"],
+        change_24h=data["change_24h"],
+        age_mins=age_mins,
+        trade_type="RANGE",
+        signal=signal,
+        reason=" | ".join(reasons) if reasons else "range play",
+        score=min(100, score),
+        target=RANGE_TARGET,
+        chart=data["chart"]
+    )
+
+
 async def scan() -> List[TokenSignal]:
-    """Scan for all 3 trade types."""
+    """Scan for all 4 trade types."""
     signals = []
     seen = set()
 
@@ -529,6 +678,12 @@ async def scan() -> List[TokenSignal]:
             gem = evaluate_gem(data)
             if gem and gem.signal != "SKIP":
                 signals.append(gem)
+                continue
+
+            # RANGE - mature tokens (24h+)
+            range_sig = evaluate_range(data)
+            if range_sig and range_sig.signal != "SKIP":
+                signals.append(range_sig)
 
     # Sort: BUY first, then by score
     signals.sort(key=lambda s: (s.signal != "BUY", -s.score))
@@ -601,9 +756,10 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
     quick = [s for s in buys if s.trade_type == "QUICK"]
     momentum = [s for s in buys if s.trade_type == "MOMENTUM"]
     gems = [s for s in buys if s.trade_type == "GEM"]
+    ranges = [s for s in buys if s.trade_type == "RANGE"]
 
     lines = [f"*SCAN* {ts}"]
-    lines.append(f"BUY: Q:{len(quick)} M:{len(momentum)} G:{len(gems)} | WATCH:{len(watches)}")
+    lines.append(f"BUY: Q:{len(quick)} M:{len(momentum)} G:{len(gems)} R:{len(ranges)} | WATCH:{len(watches)}")
 
     if quick:
         lines.append("")
@@ -629,6 +785,14 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
+    if ranges:
+        lines.append("")
+        lines.append("*📊 RANGE* (20%+ DCA)")
+        for s in ranges[:3]:
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x | 24h+")
+            lines.append(f"  {s.reason}")
+            lines.append(f"  [chart]({s.chart})")
+
     # Show WATCH signals if no BUYs
     if not buys and watches:
         lines.append("")
@@ -648,6 +812,7 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
     print(f"QUICK:    ${QUICK_MC_MIN/1000:.0f}K-${QUICK_MC_MAX/1000:.0f}K  target {QUICK_TARGET}%")
     print(f"MOMENTUM: ${MOMENTUM_MC_MIN/1000:.0f}K-${MOMENTUM_MC_MAX/1000:.0f}K target {MOMENTUM_TARGET}%")
     print(f"GEM:      <${GEM_MC_MAX/1000:.0f}K         target {GEM_TARGET}%+")
+    print(f"RANGE:    ${RANGE_MC_MIN/1000:.0f}K-${RANGE_MC_MAX/1000:.0f}K  target {RANGE_TARGET}% (24h+ DCA)")
     print(f"Telegram: {'ON' if send_to_tg else 'OFF'}\n")
 
     # Import live trader if live mode
@@ -663,9 +828,10 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
             quick = [s for s in buys if s.trade_type == "QUICK"]
             momentum = [s for s in buys if s.trade_type == "MOMENTUM"]
             gems = [s for s in buys if s.trade_type == "GEM"]
+            ranges = [s for s in buys if s.trade_type == "RANGE"]
 
             ts = datetime.now().strftime('%H:%M:%S')
-            print(f"[{ts}] Scanned {len(signals)} | BUY: Q:{len(quick)} M:{len(momentum)} G:{len(gems)} | WATCH:{len(watches)}")
+            print(f"[{ts}] Scanned {len(signals)} | BUY: Q:{len(quick)} M:{len(momentum)} G:{len(gems)} R:{len(ranges)} | WATCH:{len(watches)}")
 
             save_signals(signals)
 
@@ -678,6 +844,9 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
                 print(f"      {s.chart}")
             for s in gems[:3]:
                 print(f"  💎 G {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"      {s.chart}")
+            for s in ranges[:3]:
+                print(f"  📊 R {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
 
             # Also show WATCH signals
@@ -695,6 +864,8 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
                         "trade_type": s.trade_type,
                         "price": s.price,
                         "market_cap": s.mc,
+                        "buy_ratio": s.buy_ratio,
+                        "liquidity": s.liquidity,
                     }
                     await live_buy(signal_data)
 

@@ -1,1 +1,17 @@
 keys.env
+__pycache__/
+*.pyc
+
+# Data files (generated at runtime)
+live_positions.json
+live_trades.csv
+trading_stats.json
+signals.json
+trades.json
+trades.csv
+trade_log.csv
+
+# Logs
+logs/
+logs_archive_*/
+trade_logs/

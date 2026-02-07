@@ -7,14 +7,89 @@ Usage:
     python run.py --scan   # Scanner only
     python run.py --sim    # Sim manager only
     python run.py --reset  # Reset all data
+    python run.py --reset-live  # Reset live data only
 """
 
 import asyncio
 import argparse
 from datetime import datetime
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+
+# ============== MENU BUTTONS ==============
+
+def get_main_menu():
+    """Main menu with buttons."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Positions", callback_data="positions"),
+            InlineKeyboardButton("📡 Tracking", callback_data="tracking"),
+        ],
+        [
+            InlineKeyboardButton("📈 Stats", callback_data="stats"),
+            InlineKeyboardButton("📜 History", callback_data="history"),
+        ],
+        [
+            InlineKeyboardButton("💰 Wallet", callback_data="wallet"),
+            InlineKeyboardButton("🔄 Sync", callback_data="sync"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Scan", callback_data="scan"),
+            InlineKeyboardButton("🚨 SELL ALL", callback_data="sell_all_confirm"),
+        ],
+        [
+            InlineKeyboardButton("💀 SELL WALLET", callback_data="sell_wallet_confirm"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_position_menu():
+    """Position view buttons."""
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="positions"),
+            InlineKeyboardButton("📊 Detailed", callback_data="positions_detail"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Menu", callback_data="menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_back_menu():
+    """Simple back to menu button."""
+    keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data="menu")]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============== COMMAND HANDLERS ==============
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command - show main menu."""
+    msg = "*🚀 MEME TRADER BOT*\n\n"
+    msg += "Select an option below:"
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
+    )
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /menu command."""
+    msg = "*🚀 MEME TRADER*\n\n"
+    msg += "Select an option:"
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -27,33 +102,455 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         msg = "*SIM STATUS*\nNo positions yet"
 
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=get_back_menu()
+    )
 
 
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /live command - show live positions."""
-    from live_trader import format_live_status
+    """Handle /live command - show live positions with momentum data."""
+    from live_trader import format_live_status_detailed
 
-    msg = format_live_status()
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text("⏳ Fetching live data...")
+    msg = await format_live_status_detailed()
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=get_position_menu()
+    )
 
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /scan command - trigger immediate scan."""
     from scanner import scan, format_signal_msg
 
-    await update.message.reply_text("Scanning...")
+    await update.message.reply_text("🔍 Scanning...")
 
     signals = await scan()
     if signals:
         msg = format_signal_msg(signals)
         if msg:
-            await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+            await update.message.reply_text(
+                msg,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+                reply_markup=get_back_menu()
+            )
         else:
-            await update.message.reply_text("No signals found")
+            await update.message.reply_text("No signals found", reply_markup=get_back_menu())
     else:
-        await update.message.reply_text("No tokens found")
+        await update.message.reply_text("No tokens found", reply_markup=get_back_menu())
 
+
+# ============== BUTTON CALLBACK HANDLERS ==============
+
+async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == "menu":
+        msg = "*🚀 MEME TRADER*\n\n"
+        msg += "Select an option:"
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu()
+        )
+
+    elif data == "positions":
+        from live_trader import load_positions, get_token_metrics, get_wallet_pubkey, get_token_balance_raw, get_token_value_sol
+
+        positions = load_positions()
+        open_pos = [p for p in positions if p.status == "OPEN"]
+
+        if not open_pos:
+            msg = "*📊 POSITIONS*\n\n"
+            msg += "No open positions"
+        else:
+            wallet = get_wallet_pubkey()
+            msg = f"*📊 POSITIONS* ({len(open_pos)} open)\n\n"
+
+            total_pnl = 0.0
+            for p in open_pos:
+                metrics = await get_token_metrics(p.token_address)
+                entry = datetime.fromisoformat(p.entry_time)
+                held_mins = (datetime.now() - entry).total_seconds() / 60
+
+                if metrics and metrics.price > 0:
+                    raw_amount = await get_token_balance_raw(wallet, p.token_address)
+                    sol_value = await get_token_value_sol(p.token_address, raw_amount)
+                    if sol_value and p.sol_amount > 0:
+                        pnl = ((sol_value - p.sol_amount) / p.sol_amount) * 100
+                    else:
+                        pnl = ((metrics.price - p.entry_price) / p.entry_price) * 100
+
+                    total_pnl += pnl
+
+                    # Status emoji
+                    if pnl >= 10:
+                        emoji = "🟢"
+                    elif pnl >= 0:
+                        emoji = "🟡"
+                    else:
+                        emoji = "🔴"
+
+                    mc_str = f"{metrics.mc/1000:.0f}K" if metrics.mc < 1_000_000 else f"{metrics.mc/1_000_000:.1f}M"
+                    msg += f"{emoji} `{p.symbol}` *{pnl:+.1f}%*\n"
+                    msg += f"   MC: {mc_str} | {metrics.buy_ratio:.1f}x | {held_mins:.0f}m\n\n"
+                else:
+                    msg += f"⚪ `{p.symbol}` (no data)\n\n"
+
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"*Total: {total_pnl:+.1f}%*"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_position_menu()
+        )
+
+    elif data == "positions_detail":
+        from live_trader import format_live_status_detailed
+
+        msg = await format_live_status_detailed()
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=get_position_menu()
+        )
+
+    elif data == "scan":
+        from scanner import scan, format_signal_msg
+
+        await query.edit_message_text("🔍 *Scanning...*", parse_mode="Markdown")
+
+        signals = await scan()
+        if signals:
+            msg = format_signal_msg(signals)
+            if not msg:
+                msg = "No signals found"
+        else:
+            msg = "No tokens found"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "stats":
+        from live_trader import (
+            get_session_stats, format_session_summary,
+            format_alltime_stats, SESSION_ID
+        )
+
+        stats = get_session_stats()
+
+        # Session stats
+        msg = "*📊 CURRENT SESSION*\n"
+        msg += f"ID: `{SESSION_ID[:15]}...`\n\n"
+
+        # Balance tracking
+        if stats.starting_balance > 0:
+            change_sol = stats.wallet_change_sol
+            change_pct = stats.wallet_change_pct
+            bal_emoji = "🟢" if change_sol >= 0 else "🔴"
+            msg += f"*Start:* `{stats.starting_balance:.4f}` SOL\n"
+            msg += f"*Now:*   `{stats.current_balance:.4f}` SOL\n"
+            msg += f"{bal_emoji} *Change:* `{change_sol:+.4f}` SOL ({change_pct:+.1f}%)\n\n"
+
+        msg += f"Buys: {stats.buys} | Sells: {stats.sells}\n"
+        msg += f"W/L: {stats.wins}/{stats.losses}"
+        if stats.wins + stats.losses > 0:
+            msg += f" ({stats.win_rate:.0f}%)"
+        msg += "\n\n"
+        msg += f"SOL In:  `{stats.sol_in:.6f}`\n"
+        msg += f"SOL Out: `{stats.sol_out:.6f}`\n"
+        msg += f"*Net: {stats.net_pnl_sol:+.6f} SOL*"
+        if stats.sol_in > 0:
+            msg += f" ({stats.net_pnl_pct:+.1f}%)"
+        msg += "\n\n"
+
+        if stats.best_trade_symbol:
+            msg += f"Best: {stats.best_trade_symbol} +{stats.best_trade_pnl:.1f}%\n"
+        if stats.worst_trade_symbol:
+            msg += f"Worst: {stats.worst_trade_symbol} {stats.worst_trade_pnl:.1f}%\n"
+
+        # All-time stats
+        msg += "\n━━━━━━━━━━━━━━\n"
+        msg += format_alltime_stats()
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "wallet":
+        from live_trader import get_wallet_pubkey, get_sol_balance, load_positions
+
+        wallet = get_wallet_pubkey()
+        if wallet:
+            balance = await get_sol_balance(wallet)
+            positions = load_positions()
+            open_pos = [p for p in positions if p.status == "OPEN"]
+            used = sum(p.sol_amount for p in open_pos)
+
+            msg = "*💰 WALLET*\n\n"
+            msg += f"Address: `{wallet[:8]}...{wallet[-4:]}`\n\n"
+            msg += f"Balance: *{balance:.4f} SOL*\n"
+            msg += f"In Trades: {used:.4f} SOL\n"
+            msg += f"Available: {balance - used:.4f} SOL\n"
+        else:
+            msg = "*💰 WALLET*\n\n"
+            msg += "⚠️ No wallet configured"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "sync":
+        from live_trader import (
+            load_positions, get_wallet_pubkey, get_token_metrics,
+            get_all_token_accounts, sync_positions
+        )
+
+        await query.edit_message_text("???? *Syncing with blockchain...*", parse_mode="Markdown")
+
+        wallet = get_wallet_pubkey()
+        msg = "*???? SYNC RESULTS*\n\n"
+
+        # Use canonical sync (fixes OPEN/CLOSED mismatches)
+        sync_result = await sync_positions()
+        closed_syms = sync_result.get("closed_syms", [])
+        reopened_syms = sync_result.get("reopened_syms", [])
+
+        if closed_syms or reopened_syms:
+            msg += "*Tracked Positions:*\n"
+            if closed_syms:
+                msg += f"??? Closed: {', '.join([f'`{s}`' for s in closed_syms])}\n"
+            if reopened_syms:
+                msg += f"??? Re-opened: {', '.join([f'`{s}`' for s in reopened_syms])}\n"
+            msg += "\n"
+
+        # Find UNTRACKED tokens in wallet
+        msg += "*Wallet Scan:*\n"
+        positions = load_positions()
+        open_pos = [p for p in positions if p.status == "OPEN"]
+        tracked_addresses = {p.token_address for p in open_pos}
+
+        all_tokens = await get_all_token_accounts(wallet)
+        untracked = []
+
+        for token in all_tokens:
+            mint = token["mint"]
+            if mint not in tracked_addresses and mint != "So11111111111111111111111111111111111111112":
+                metrics = await get_token_metrics(mint)
+                if metrics and metrics.mc > 0:
+                    untracked.append({
+                        "mint": mint,
+                        "amount": token["amount"],
+                        "symbol": "???",
+                        "mc": metrics.mc,
+                        "price": metrics.price
+                    })
+
+        if untracked:
+            msg += f"?????? *{len(untracked)} UNTRACKED tokens!*\n"
+            for t in untracked[:5]:  # Show max 5
+                mc_str = f"{t['mc']/1000:.0f}K" if t['mc'] < 1_000_000 else f"{t['mc']/1_000_000:.1f}M"
+                msg += f"  ??? MC:{mc_str} `{t['mint'][:8]}...`\n"
+            if len(untracked) > 5:
+                msg += f"  _...and {len(untracked)-5} more_\n"
+            msg += "\n_These tokens are in wallet but not tracked!_"
+        else:
+            msg += "??? No untracked tokens"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+    elif data == "tracking":
+        from live_trader import get_tracked_signals_status, SIGNAL_MIN_AGE_MINS, DIP_FROM_PEAK_PCT
+
+        msg = get_tracked_signals_status()
+        msg += f"\n\n_Buy after {SIGNAL_MIN_AGE_MINS}m + {DIP_FROM_PEAK_PCT}% dip_"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "history":
+        from live_trader import load_positions
+
+        positions = load_positions()
+        closed = [p for p in positions if p.status == "CLOSED"]
+
+        msg = "*📜 TRADE HISTORY*\n\n"
+
+        if closed:
+            # Sort by exit time, most recent first
+            closed.sort(key=lambda p: p.exit_time, reverse=True)
+
+            for p in closed[:15]:  # Show last 15 trades
+                emoji = "🟢" if p.pnl_percent > 0 else "🔴"
+                exit_time = datetime.fromisoformat(p.exit_time).strftime("%m/%d %H:%M")
+                entry_time = datetime.fromisoformat(p.entry_time)
+                exit_dt = datetime.fromisoformat(p.exit_time)
+                held_mins = (exit_dt - entry_time).total_seconds() / 60
+
+                mc_str = f"{p.entry_mc/1000:.0f}K" if p.entry_mc < 1_000_000 else f"{p.entry_mc/1_000_000:.1f}M"
+
+                msg += f"{emoji} `{p.symbol}` *{p.pnl_percent:+.1f}%*\n"
+                msg += f"   {exit_time} | {held_mins:.0f}m | MC:{mc_str}\n"
+
+                # Show max vs exit for analysis
+                if p.max_pnl_percent > p.pnl_percent + 5:
+                    msg += f"   ⚠️ Max was +{p.max_pnl_percent:.0f}%\n"
+
+            if len(closed) > 15:
+                msg += f"\n_...and {len(closed)-15} more trades_"
+        else:
+            msg += "No trade history yet"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "sell_all_confirm":
+        from live_trader import load_positions
+
+        positions = load_positions()
+        open_pos = [p for p in positions if p.status == "OPEN"]
+
+        if not open_pos:
+            msg = "*🚨 SELL ALL*\n\nNo open positions to sell"
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
+        else:
+            msg = "*🚨 SELL ALL POSITIONS?*\n\n"
+            msg += f"This will sell *{len(open_pos)}* positions:\n\n"
+            for p in open_pos:
+                msg += f"• `{p.symbol}` ({p.sol_amount:.4f} SOL)\n"
+            msg += "\n⚠️ *This cannot be undone!*"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ YES, SELL ALL", callback_data="sell_all_execute"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="menu"),
+                ],
+            ]
+            await query.edit_message_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    elif data == "sell_all_execute":
+        from live_trader import sell_all_positions
+
+        await query.edit_message_text("🚨 *SELLING ALL POSITIONS...*", parse_mode="Markdown")
+
+        result = await sell_all_positions("PANIC_SELL")
+
+        msg = "*🚨 SELL ALL COMPLETE*\n\n"
+        msg += f"✅ Sold: {result['sold']}\n"
+        if result['failed'] > 0:
+            msg += f"❌ Failed: {result['failed']}\n"
+        msg += f"\n*Total PnL: {result['total_pnl']:+.1f}%*"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "sell_wallet_confirm":
+        from live_trader import get_all_token_accounts, get_wallet_pubkey, load_positions
+
+        wallet = get_wallet_pubkey()
+        if not wallet:
+            await query.edit_message_text("⚠️ No wallet configured", parse_mode="Markdown", reply_markup=get_back_menu())
+            return
+
+        # Count all tokens in wallet
+        all_tokens = await get_all_token_accounts(wallet)
+        positions = load_positions()
+        tracked_addresses = {p.token_address for p in positions if p.status == "OPEN"}
+
+        # Filter out native SOL
+        sol_mint = "So11111111111111111111111111111111111111112"
+        token_count = len([t for t in all_tokens if t["mint"] != sol_mint and t["amount"] > 0])
+        untracked_count = len([t for t in all_tokens if t["mint"] != sol_mint and t["amount"] > 0 and t["mint"] not in tracked_addresses])
+
+        if token_count == 0:
+            msg = "*💀 SELL WALLET*\n\nNo tokens in wallet"
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
+        else:
+            msg = "*💀 SELL ALL WALLET TOKENS?*\n\n"
+            msg += f"This will sell *{token_count}* tokens:\n"
+            msg += f"• {len(tracked_addresses)} tracked positions\n"
+            msg += f"• {untracked_count} UNTRACKED tokens\n\n"
+            msg += "⚠️ *Sells EVERYTHING including untracked!*"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("💀 YES, SELL WALLET", callback_data="sell_wallet_execute"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="menu"),
+                ],
+            ]
+            await query.edit_message_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    elif data == "sell_wallet_execute":
+        from live_trader import sell_all_wallet_tokens
+
+        await query.edit_message_text("💀 *SELLING ALL WALLET TOKENS...*", parse_mode="Markdown")
+
+        result = await sell_all_wallet_tokens()
+
+        msg = "*💀 WALLET CLEARED*\n\n"
+        msg += f"✅ Sold: {result['sold']}\n"
+        if result['failed'] > 0:
+            msg += f"❌ Failed: {result['failed']}\n"
+        msg += f"\n*SOL recovered: {result.get('total_sol', 0):.6f}*"
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "refresh":
+        msg = "*🚀 MEME TRADER*\n\n"
+        msg += f"_Updated: {datetime.now().strftime('%H:%M:%S')}_\n\n"
+        msg += "Select an option:"
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu()
+        )
+
+
+# ============== BOT RUNNER ==============
 
 async def run_bot():
     """Run Telegram bot for commands."""
@@ -62,22 +559,31 @@ async def run_bot():
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Command handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("live", cmd_live))
-    app.add_handler(CommandHandler("s", cmd_status))  # Short alias
-    app.add_handler(CommandHandler("l", cmd_live))    # Short alias
+    app.add_handler(CommandHandler("s", cmd_status))
+    app.add_handler(CommandHandler("l", cmd_live))
+    app.add_handler(CommandHandler("m", cmd_menu))
+
+    # Button callback handler
+    app.add_handler(CallbackQueryHandler(button_callback))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    print("TG Bot: /status /scan /live")
+    print("TG Bot: /start /menu /status /scan /live")
 
-    # Keep running
     while True:
         await asyncio.sleep(60)
 
+
+# ============== MODE RUNNERS ==============
 
 async def run_all(no_tg: bool = False):
     """Run scanner and sim manager together."""
@@ -96,13 +602,12 @@ async def run_all(no_tg: bool = False):
     print("Telegram: 60s updates")
     print("Output:   trades.csv")
     print(f"TG: {'ON' if send_tg else 'OFF'}")
-    print("Commands: /status /scan /live")
+    print("Commands: /start /menu /status /scan /live")
     print()
     print("Ctrl+C to stop")
     print("=" * 50)
     print()
 
-    # Run all concurrently
     tasks = [
         run_scanner(interval_secs=30, send_to_tg=send_tg),
         run_manager(interval_secs=15, send_to_tg=send_tg),
@@ -150,10 +655,42 @@ def reset_all():
     print("\nData reset complete")
 
 
+def reset_live():
+    """Reset live trading data."""
+    import os
+    import shutil
+
+    files = [
+        "live_positions.json",
+        "live_trades.csv",
+        "trading_stats.json",
+        "signals.json",
+    ]
+
+    for f in files:
+        if os.path.exists(f):
+            os.remove(f)
+            print(f"Deleted: {f}")
+
+    # Archive old logs instead of deleting
+    if os.path.exists("logs"):
+        archive_name = f"logs_archive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        shutil.move("logs", archive_name)
+        print(f"Archived logs -> {archive_name}/")
+
+    print("\nLive data reset complete - fresh start!")
+
+
 async def run_live():
     """Run scanner with LIVE trading."""
     from scanner import run_scanner
-    from live_trader import run_live_manager
+    from live_trader import (
+        run_live_manager, run_tg_position_updates, MAX_POSITION_SOL, WALLET_UTILIZATION,
+        MAX_OPEN_TRADES, MAX_SLIPPAGE_BPS, MAX_TRADES_PER_TOKEN,
+        MC_STALL_MINS, VOL_DECAY_THRESHOLD, MIN_FEE_RESERVE,
+        CONFIRMATION_COUNT, CONFIRMATION_WINDOW_SECS, MIN_BUY_RATIO, MIN_SIGNAL_LIQUIDITY,
+        SIGNAL_MIN_AGE_MINS, SIGNAL_MAX_AGE_MINS, DIP_FROM_PEAK_PCT, MIN_DIP_PCT
+    )
 
     print("=" * 50)
     print("!!! LIVE TRADING MODE !!!")
@@ -161,7 +698,30 @@ async def run_live():
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     print("Scanner:  30s interval")
-    print("Trader:   30s position check")
+    print("Trader:   15s position check (FAST)")
+    print("TG:       2min position updates")
+    print()
+    print("=== ENTRY FILTERS (DIP BUYING) ===")
+    print(f"Signal aging:      {SIGNAL_MIN_AGE_MINS}m min (max {SIGNAL_MAX_AGE_MINS}m)")
+    print(f"Dip required:      {DIP_FROM_PEAK_PCT}% from peak (min {MIN_DIP_PCT}%)")
+    print(f"Min buy ratio:     {MIN_BUY_RATIO}x")
+    print(f"Min liquidity:     ${MIN_SIGNAL_LIQUIDITY:,.0f}")
+    print()
+    print("=== POSITION MANAGEMENT ===")
+    print(f"Max position:      {MAX_POSITION_SOL} SOL")
+    print(f"Wallet util:       {WALLET_UTILIZATION*100:.0f}%")
+    print(f"Fee reserve:       {MIN_FEE_RESERVE} SOL")
+    print(f"Max open trades:   {MAX_OPEN_TRADES}")
+    print(f"Slippage:          {MAX_SLIPPAGE_BPS/100}%")
+    print()
+    print("=== EXIT CONDITIONS (AGGRESSIVE) ===")
+    print(f"Max trades/token:  {MAX_TRADES_PER_TOKEN}")
+    print(f"Trailing stops:    8%→4% (<3m) | 6%→3% (3-8m) | 5%→2% (>8m)")
+    print(f"Profit lock:       Exit at +3% if max was +6%")
+    print(f"Emergency save:    Exit at 0% if max was +10%")
+    print(f"Vol decay:         {VOL_DECAY_THRESHOLD*100:.0f}% of entry vol AND -5% pnl")
+    print(f"Dump exit:         sells > 2x buys AND -10% pnl")
+    print(f"MC stall:          {MC_STALL_MINS}m if MC -15% from peak")
     print()
     print("THIS USES REAL MONEY!")
     print("Ctrl+C to stop")
@@ -170,7 +730,8 @@ async def run_live():
 
     await asyncio.gather(
         run_scanner(interval_secs=30, send_to_tg=True, live_mode=True),
-        run_live_manager(interval_secs=30),
+        run_live_manager(interval_secs=15),
+        run_tg_position_updates(interval_secs=120),
         run_bot(),
     )
 
@@ -181,11 +742,14 @@ def main():
     parser.add_argument("--sim", action="store_true", help="Run sim manager only")
     parser.add_argument("--live", action="store_true", help="Run with LIVE trading")
     parser.add_argument("--reset", action="store_true", help="Reset all data")
+    parser.add_argument("--reset-live", action="store_true", help="Reset live data only")
     parser.add_argument("--no-tg", action="store_true", help="Disable Telegram output")
     args = parser.parse_args()
 
     if args.reset:
         reset_all()
+    elif args.reset_live:
+        reset_live()
     elif args.scan:
         asyncio.run(run_scanner_only())
     elif args.sim:
