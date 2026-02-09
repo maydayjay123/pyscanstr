@@ -20,10 +20,10 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 load_dotenv("keys.env")
 
 
-async def send_tg(text: str, reply_markup: dict = None):
-    """Send message to Telegram with optional buttons."""
+async def send_tg(text: str, reply_markup: dict = None) -> int:
+    """Send message to Telegram with optional buttons. Returns message_id."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return 0
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -35,9 +35,34 @@ async def send_tg(text: str, reply_markup: dict = None):
         if reply_markup:
             payload["reply_markup"] = reply_markup
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json=payload, timeout=10)
+            async with session.post(url, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                return data.get("result", {}).get("message_id", 0)
     except:
-        pass
+        return 0
+
+
+async def edit_tg(message_id: int, text: str, reply_markup: dict = None) -> bool:
+    """Edit an existing TG message. Returns True if successful."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                return data.get("ok", False)
+    except:
+        return False
 
 
 def get_quick_buttons():
@@ -1916,17 +1941,30 @@ async def format_tg_position_update() -> str:
 
 
 async def run_tg_position_updates(interval_secs: int = None):
-    """Send periodic position updates to TG with buttons."""
+    """Send periodic position updates to TG - edits same message in place."""
     if interval_secs is None:
         interval_secs = TG_POSITION_UPDATE_SECS
 
-    print(f"TG position updates: every {interval_secs}s")
+    print(f"TG position updates: every {interval_secs}s (single message)")
+
+    live_msg_id = 0  # Track the message to edit
 
     while True:
         try:
             msg = await format_tg_position_update()
             if msg:
-                await send_tg(msg, reply_markup=get_quick_buttons())
+                # Add timestamp so user knows it's fresh
+                msg += f"\n_Updated: {datetime.now().strftime('%H:%M:%S')}_"
+
+                if live_msg_id:
+                    # Try to edit existing message
+                    success = await edit_tg(live_msg_id, msg, reply_markup=get_quick_buttons())
+                    if not success:
+                        # Message was deleted or too old, send new one
+                        live_msg_id = await send_tg(msg, reply_markup=get_quick_buttons())
+                else:
+                    # First update - send new message
+                    live_msg_id = await send_tg(msg, reply_markup=get_quick_buttons())
         except Exception as e:
             print(f"TG update error: {e}")
 
