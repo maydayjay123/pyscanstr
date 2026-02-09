@@ -653,6 +653,215 @@ class TokenMetrics:
         return self.vol_1h > 0 and (self.vol_5m * 12) < (self.vol_1h * 0.3)
 
 
+# ===== POOL PRICE ENGINE: Direct on-chain pricing via LP reserves =====
+# Reads pool vault balances from RPC - no rate limit issues
+RAYDIUM_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+METEORA_DLMM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+METEORA_DYNAMIC = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"
+SUPPORTED_POOL_PROGRAMS = {RAYDIUM_AMM_V4, METEORA_DLMM, METEORA_DYNAMIC}
+_POOL_CACHE = {}  # {token_address: {"pool_addr", "coin_vault", "sol_vault"}}
+_SOL_USD_PRICE = 0.0
+_SOL_USD_LAST = 0.0
+
+
+async def get_sol_usd_price() -> float:
+    """Get SOL/USD price, cached for 60s. Uses Jupiter SOL->USDC quote."""
+    import time
+    global _SOL_USD_PRICE, _SOL_USD_LAST
+    now = time.time()
+    if _SOL_USD_PRICE > 0 and now - _SOL_USD_LAST < 60:
+        return _SOL_USD_PRICE
+    try:
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        params = {"inputMint": SOL_MINT, "outputMint": usdc_mint,
+                  "amount": str(1_000_000_000), "slippageBps": 50}
+        await _jupiter_rate_wait()
+        async with aiohttp.ClientSession() as session:
+            for url in JUPITER_QUOTE_URLS:
+                try:
+                    async with session.get(url, params=params, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            _SOL_USD_PRICE = int(data.get("outAmount", 0)) / 1_000_000
+                            _SOL_USD_LAST = now
+                            return _SOL_USD_PRICE
+                except:
+                    continue
+    except:
+        pass
+    return _SOL_USD_PRICE
+
+
+async def _find_pool_for_token(token_address: str) -> Optional[str]:
+    """Find the best pool address for a token from DexScreener (Raydium or Meteora)."""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                pairs = data.get("pairs", [])
+                # Priority 1: Raydium with SOL quote (most common)
+                for pair in pairs:
+                    dex = pair.get("dexId", "")
+                    quote = pair.get("quoteToken", {}).get("address", "")
+                    pool = pair.get("pairAddress", "")
+                    if dex == "raydium" and quote == SOL_MINT and pool:
+                        return pool
+                # Priority 2: Meteora with SOL quote (pump.fun graduated)
+                for pair in pairs:
+                    dex = pair.get("dexId", "")
+                    quote = pair.get("quoteToken", {}).get("address", "")
+                    pool = pair.get("pairAddress", "")
+                    if dex == "meteora" and quote == SOL_MINT and pool:
+                        return pool
+                # Fallback: any Raydium or Meteora pair
+                for pair in pairs:
+                    dex = pair.get("dexId", "")
+                    if dex in ("raydium", "meteora") and pair.get("pairAddress"):
+                        return pair["pairAddress"]
+    except:
+        pass
+    return None
+
+
+async def _decode_pool_vaults(pool_addr: str, token_address: str) -> Optional[dict]:
+    """Decode pool account to find vault addresses (Raydium + Meteora).
+
+    Raydium V4: [vault1][vault2][mint1][mint2] (vaults BEFORE mints)
+    Meteora:    [mint1][mint2][vault1][vault2] (mints BEFORE vaults)
+    We find both mints in the data, check program owner, extract vaults.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getAccountInfo",
+                "params": [pool_addr, {"encoding": "base64"}]
+            }
+            async with session.post(SOLANA_RPC_URL, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                account = data.get("result", {}).get("value")
+                if not account:
+                    return None
+
+                owner = account.get("owner", "")
+                if owner not in SUPPORTED_POOL_PROGRAMS:
+                    print(f"Pool {pool_addr[:8]} unsupported program: {owner[:12]}")
+                    return None
+
+                raw = base64.b64decode(account["data"][0])
+                sol_bytes = base58.b58decode(SOL_MINT)
+                token_bytes = base58.b58decode(token_address)
+
+                sol_pos = raw.find(sol_bytes)
+                token_pos = raw.find(token_bytes)
+
+                if sol_pos < 0 or token_pos < 0:
+                    print(f"Pool decode: mints not found in data")
+                    return None
+
+                # Mints should be adjacent (32 bytes apart)
+                if abs(token_pos - sol_pos) != 32:
+                    print(f"Pool decode: mints not adjacent (gap={abs(token_pos-sol_pos)})")
+                    return None
+
+                first_pos = min(token_pos, sol_pos)
+                last_pos = max(token_pos, sol_pos)
+
+                if owner == RAYDIUM_AMM_V4:
+                    # Raydium: vaults are BEFORE mints
+                    if first_pos < 64:
+                        return None
+                    v1 = base58.b58encode(raw[first_pos-64:first_pos-32]).decode()
+                    v2 = base58.b58encode(raw[first_pos-32:first_pos]).decode()
+                    if token_pos < sol_pos:
+                        coin_vault, sol_vault = v1, v2
+                    else:
+                        sol_vault, coin_vault = v1, v2
+                else:
+                    # Meteora (DLMM/Dynamic): vaults are AFTER mints
+                    vault_start = last_pos + 32
+                    if vault_start + 64 > len(raw):
+                        return None
+                    v1 = base58.b58encode(raw[vault_start:vault_start+32]).decode()
+                    v2 = base58.b58encode(raw[vault_start+32:vault_start+64]).decode()
+                    if token_pos < sol_pos:
+                        coin_vault, sol_vault = v1, v2
+                    else:
+                        sol_vault, coin_vault = v1, v2
+
+                pool_type = "Raydium" if owner == RAYDIUM_AMM_V4 else "Meteora"
+                print(f"Pool decoded ({pool_type}): coin={coin_vault[:8]}... sol={sol_vault[:8]}...")
+                return {"coin_vault": coin_vault, "sol_vault": sol_vault}
+    except Exception as e:
+        print(f"Pool decode error: {e}")
+        return None
+
+
+async def get_pool_price(token_address: str) -> Optional[dict]:
+    """Get token price from LP pool reserves via RPC.
+
+    Returns {"price_usd": float, "price_sol": float, "sol_reserve": float}
+    or None if pool not available.
+    """
+    cache = _POOL_CACHE.get(token_address)
+
+    # Get pool address (one-time per token)
+    if not cache:
+        pool_addr = await _find_pool_for_token(token_address)
+        if not pool_addr:
+            return None
+        _POOL_CACHE[token_address] = {"pool_addr": pool_addr}
+        cache = _POOL_CACHE[token_address]
+
+    # Decode vault addresses (one-time per pool)
+    if not cache.get("coin_vault"):
+        vaults = await _decode_pool_vaults(cache["pool_addr"], token_address)
+        if not vaults:
+            _POOL_CACHE.pop(token_address, None)  # Clear bad cache
+            return None
+        cache.update(vaults)
+
+    # Read vault balances from RPC (this is the live price check)
+    try:
+        async with aiohttp.ClientSession() as session:
+            sol_bal = 0.0
+            token_bal = 0.0
+
+            for vault, is_sol in [(cache["sol_vault"], True), (cache["coin_vault"], False)]:
+                payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenAccountBalance",
+                    "params": [vault]
+                }
+                async with session.post(SOLANA_RPC_URL, json=payload, timeout=10) as resp:
+                    rdata = await resp.json()
+                    val = rdata.get("result", {}).get("value", {})
+                    ui_amount = float(val.get("uiAmount", 0) or 0)
+                    if is_sol:
+                        sol_bal = ui_amount
+                    else:
+                        token_bal = ui_amount
+
+            if token_bal <= 0 or sol_bal <= 0:
+                return None
+
+            price_sol = sol_bal / token_bal
+            sol_usd = await get_sol_usd_price()
+            price_usd = price_sol * sol_usd if sol_usd > 0 else 0
+
+            return {
+                "price_usd": price_usd,
+                "price_sol": price_sol,
+                "sol_reserve": sol_bal,
+                "token_reserve": token_bal,
+            }
+    except Exception as e:
+        return None
+
+
 async def get_token_metrics(token_address: str, retries: int = 3) -> Optional[TokenMetrics]:
     """Get comprehensive token metrics from DexScreener with retry."""
     for attempt in range(retries):
@@ -682,6 +891,17 @@ async def get_token_metrics(token_address: str, retries: int = 3) -> Optional[To
                             )
                             # Validate we got real data
                             if metrics.price > 0 or metrics.mc > 0:
+                                # Override price with pool data (more accurate than DexScreener)
+                                try:
+                                    pool = await get_pool_price(token_address)
+                                    if pool and pool["price_usd"] > 0:
+                                        dex_price = metrics.price
+                                        metrics.price = pool["price_usd"]
+                                        # Recalculate MC from pool price if we have DexScreener's FDV ratio
+                                        if dex_price > 0 and metrics.mc > 0:
+                                            metrics.mc = metrics.mc * (pool["price_usd"] / dex_price)
+                                except:
+                                    pass  # Fall back to DexScreener price
                                 return metrics
         except Exception as e:
             if attempt < retries - 1:
