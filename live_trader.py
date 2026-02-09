@@ -658,7 +658,10 @@ class TokenMetrics:
 RAYDIUM_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 METEORA_DLMM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 METEORA_DYNAMIC = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"
-SUPPORTED_POOL_PROGRAMS = {RAYDIUM_AMM_V4, METEORA_DLMM, METEORA_DYNAMIC}
+PUMPFUN_AMM = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
+SUPPORTED_POOL_PROGRAMS = {RAYDIUM_AMM_V4, METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM}
+# Programs that use vaults-after-mints layout (Meteora + PumpFun AMM)
+_VAULTS_AFTER_MINTS = {METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM}
 _POOL_CACHE = {}  # {token_address: {"pool_addr", "coin_vault", "sol_vault"}}
 _SOL_USD_PRICE = 0.0
 _SOL_USD_LAST = 0.0
@@ -693,7 +696,7 @@ async def get_sol_usd_price() -> float:
 
 
 async def _find_pool_for_token(token_address: str) -> Optional[str]:
-    """Find the best pool address for a token from DexScreener (Raydium or Meteora)."""
+    """Find the best pool address for a token from DexScreener."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         async with aiohttp.ClientSession() as session:
@@ -716,10 +719,17 @@ async def _find_pool_for_token(token_address: str) -> Optional[str]:
                     pool = pair.get("pairAddress", "")
                     if dex == "meteora" and quote == SOL_MINT and pool:
                         return pool
-                # Fallback: any Raydium or Meteora pair
+                # Priority 3: PumpFun AMM with SOL quote
                 for pair in pairs:
                     dex = pair.get("dexId", "")
-                    if dex in ("raydium", "meteora") and pair.get("pairAddress"):
+                    quote = pair.get("quoteToken", {}).get("address", "")
+                    pool = pair.get("pairAddress", "")
+                    if dex in ("pumpfun", "pump_fun", "pump.fun") and quote == SOL_MINT and pool:
+                        return pool
+                # Fallback: any SOL-paired pool (decoder verifies program owner)
+                for pair in pairs:
+                    quote = pair.get("quoteToken", {}).get("address", "")
+                    if quote == SOL_MINT and pair.get("pairAddress"):
                         return pair["pairAddress"]
     except:
         pass
@@ -727,10 +737,10 @@ async def _find_pool_for_token(token_address: str) -> Optional[str]:
 
 
 async def _decode_pool_vaults(pool_addr: str, token_address: str) -> Optional[dict]:
-    """Decode pool account to find vault addresses (Raydium + Meteora).
+    """Decode pool account to find vault addresses (Raydium + Meteora + PumpFun AMM).
 
-    Raydium V4: [vault1][vault2][mint1][mint2] (vaults BEFORE mints)
-    Meteora:    [mint1][mint2][vault1][vault2] (mints BEFORE vaults)
+    Raydium V4:       [vault1][vault2][mint1][mint2] (vaults BEFORE mints)
+    Meteora/PumpFun:  [mint1][mint2][vault1][vault2] (mints BEFORE vaults)
     We find both mints in the data, check program owner, extract vaults.
     """
     try:
@@ -781,7 +791,7 @@ async def _decode_pool_vaults(pool_addr: str, token_address: str) -> Optional[di
                     else:
                         sol_vault, coin_vault = v1, v2
                 else:
-                    # Meteora (DLMM/Dynamic): vaults are AFTER mints
+                    # Meteora/PumpFun AMM: vaults are AFTER mints
                     vault_start = last_pos + 32
                     if vault_start + 64 > len(raw):
                         return None
@@ -792,7 +802,7 @@ async def _decode_pool_vaults(pool_addr: str, token_address: str) -> Optional[di
                     else:
                         sol_vault, coin_vault = v1, v2
 
-                pool_type = "Raydium" if owner == RAYDIUM_AMM_V4 else "Meteora"
+                pool_type = "Raydium" if owner == RAYDIUM_AMM_V4 else "PumpFun" if owner == PUMPFUN_AMM else "Meteora"
                 print(f"Pool decoded ({pool_type}): coin={coin_vault[:8]}... sol={sol_vault[:8]}...")
                 return {"coin_vault": coin_vault, "sol_vault": sol_vault}
     except Exception as e:
