@@ -34,6 +34,13 @@ import json
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+# Pool price engine - import from live_trader for accurate on-chain pricing
+try:
+    from live_trader import get_pool_price, get_sol_usd_price
+    _HAS_POOL_PRICE = True
+except ImportError:
+    _HAS_POOL_PRICE = False
+
 
 @dataclass
 class TokenSignal:
@@ -617,6 +624,61 @@ def evaluate_range(data: dict) -> Optional[TokenSignal]:
     )
 
 
+async def _verify_pool_price(signal: TokenSignal) -> TokenSignal:
+    """Verify BUY signal price/MC with on-chain pool data.
+    If pool price differs significantly, update the signal.
+    Returns updated signal (may downgrade BUY to WATCH if MC out of range)."""
+    if not _HAS_POOL_PRICE:
+        return signal
+    try:
+        pool = await get_pool_price(signal.address)
+        if not pool or pool["price_usd"] <= 0:
+            return signal
+
+        pool_price = pool["price_usd"]
+        dex_price = signal.price
+
+        # Calculate how far off DexScreener is
+        if dex_price > 0:
+            drift_pct = abs(pool_price - dex_price) / dex_price * 100
+        else:
+            drift_pct = 100
+
+        # Update signal with pool price
+        if dex_price > 0 and signal.mc > 0:
+            pool_mc = signal.mc * (pool_price / dex_price)
+        else:
+            pool_mc = signal.mc
+
+        signal.price = pool_price
+        signal.mc = pool_mc
+
+        if drift_pct > 5:
+            print(f"  Pool price {signal.symbol}: ${pool_price:.10f} (DexScreener was {drift_pct:.0f}% off)")
+
+        # Check if corrected MC still fits the trade type range
+        if signal.signal == "BUY":
+            mc = pool_mc
+            out_of_range = False
+            if signal.trade_type == "QUICK" and not (QUICK_MC_MIN <= mc <= QUICK_MC_MAX):
+                out_of_range = True
+            elif signal.trade_type == "MOMENTUM" and not (MOMENTUM_MC_MIN <= mc <= MOMENTUM_MC_MAX):
+                out_of_range = True
+            elif signal.trade_type == "GEM" and mc > GEM_MC_MAX:
+                out_of_range = True
+            elif signal.trade_type == "RANGE" and not (RANGE_MC_MIN <= mc <= RANGE_MC_MAX):
+                out_of_range = True
+
+            if out_of_range:
+                print(f"  {signal.symbol} BUY->WATCH: pool MC ${mc:,.0f} out of {signal.trade_type} range")
+                signal.signal = "WATCH"
+                signal.reason += " | MC drift"
+
+    except Exception as e:
+        pass  # Fall back to DexScreener price
+    return signal
+
+
 async def scan() -> List[TokenSignal]:
     """Scan for all 4 trade types."""
     signals = []
@@ -684,6 +746,16 @@ async def scan() -> List[TokenSignal]:
             range_sig = evaluate_range(data)
             if range_sig and range_sig.signal != "SKIP":
                 signals.append(range_sig)
+
+    # Verify BUY signals with on-chain pool price (only BUYs to limit RPC calls)
+    if _HAS_POOL_PRICE:
+        buy_signals = [s for s in signals if s.signal == "BUY"]
+        for i, sig in enumerate(buy_signals):
+            try:
+                verified = await _verify_pool_price(sig)
+                # Signal was modified in-place, no need to replace
+            except:
+                pass
 
     # Sort: BUY first, then by score
     signals.sort(key=lambda s: (s.signal != "BUY", -s.score))
