@@ -691,7 +691,7 @@ async def run_live():
     """Run scanner with LIVE trading."""
     from scanner import run_scanner
     from live_trader import (
-        run_live_manager, run_tg_position_updates, MAX_POSITION_SOL, WALLET_UTILIZATION,
+        run_live_manager, run_tg_position_updates, WALLET_UTILIZATION,
         MAX_OPEN_TRADES, MAX_SLIPPAGE_BPS, MAX_TRADES_PER_TOKEN,
         MC_STALL_MINS, VOL_DECAY_THRESHOLD, MIN_FEE_RESERVE,
         CONFIRMATION_COUNT, CONFIRMATION_WINDOW_SECS, MIN_BUY_RATIO, MIN_SIGNAL_LIQUIDITY,
@@ -714,8 +714,7 @@ async def run_live():
     print(f"Min liquidity:     ${MIN_SIGNAL_LIQUIDITY:,.0f}")
     print()
     print("=== POSITION MANAGEMENT ===")
-    print(f"Max position:      {MAX_POSITION_SOL} SOL")
-    print(f"Wallet util:       {WALLET_UTILIZATION*100:.0f}%")
+    print(f"Sizing:            dynamic ({WALLET_UTILIZATION*100:.0f}% wallet / {MAX_OPEN_TRADES} trades)")
     print(f"Fee reserve:       {MIN_FEE_RESERVE} SOL")
     print(f"Max open trades:   {MAX_OPEN_TRADES}")
     print(f"Slippage:          {MAX_SLIPPAGE_BPS/100}%")

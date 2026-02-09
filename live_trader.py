@@ -100,7 +100,6 @@ def get_trade_buttons():
     }
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", "0.1"))
 MAX_SLIPPAGE_BPS = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "5")) * 100)  # Convert to basis points
 WALLET_UTILIZATION = float(os.getenv("WALLET_UTILIZATION", "0.85"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
@@ -366,6 +365,11 @@ DCA_STEP_TRIGGERS = [0, 12, 28]  # Entry, 12% dip, 28% dip from avg
 _KEYPAIR_CACHE = None
 _SIGNAL_HISTORY = {}
 
+# Trade memory - tracks recently closed positions to prevent bad re-entries
+# {token_address: {"exit_price": float, "peak_price": float, "entry_price": float,
+#                   "pnl": float, "exit_time": str, "symbol": str}}
+_TRADE_MEMORY = {}
+
 # Signal tracker - tracks tokens over time for dip buying
 @dataclass
 class TrackedSignal:
@@ -566,6 +570,18 @@ async def get_sol_balance(pubkey: str) -> float:
         return 0.0
 
 
+async def calc_trade_budget() -> float:
+    """Calculate full position budget for one trade (before DCA step split).
+
+    Dynamic sizing: (wallet_balance * 85%) / max_open_trades.
+    Recalculates each time based on current wallet balance.
+    """
+    wallet = get_wallet_pubkey()
+    sol_balance = await get_sol_balance(wallet)
+    usable = max(0.0, sol_balance - MIN_FEE_RESERVE)
+    return (usable * WALLET_UTILIZATION) / MAX_OPEN_TRADES
+
+
 async def get_token_balance_raw(pubkey: str, mint: str) -> int:
     """Get raw token balance for a mint (supports SPL + Token-2022)."""
     try:
@@ -685,6 +701,57 @@ def count_trades_for_token(token_address: str) -> int:
     """Count how many times we've traded this token in the session."""
     positions = load_positions()
     return len([p for p in positions if p.token_address == token_address])
+
+
+def record_trade_memory(pos: LivePosition):
+    """Record closed position data for smart re-entry decisions."""
+    _TRADE_MEMORY[pos.token_address] = {
+        "symbol": pos.symbol,
+        "entry_price": pos.entry_price,
+        "exit_price": pos.exit_price,
+        "peak_price": pos.entry_price * (1 + pos.max_pnl_percent / 100) if pos.max_pnl_percent > 0 else pos.exit_price,
+        "pnl": pos.pnl_percent,
+        "exit_time": pos.exit_time or datetime.now().isoformat(),
+        "max_pnl": pos.max_pnl_percent,
+    }
+    print(f"Trade memory: ${pos.symbol} exit {pos.pnl_percent:+.1f}% peak_pnl {pos.max_pnl_percent:+.1f}%")
+
+
+def check_reentry_safe(token_address: str, current_price: float) -> tuple[bool, str]:
+    """Check if re-entering a previously traded token is safe.
+
+    Rules:
+    - 30 min cooldown after any sell
+    - After a profitable pump (>20% max PnL): price must drop 25% from peak
+    - After a loss: price must drop 15% from our entry (don't catch same knife)
+    """
+    mem = _TRADE_MEMORY.get(token_address)
+    if not mem:
+        return True, ""
+
+    symbol = mem["symbol"]
+    exit_time = datetime.fromisoformat(mem["exit_time"])
+    mins_since_exit = (datetime.now() - exit_time).total_seconds() / 60
+
+    # Rule 1: Minimum 30 min cooldown after any sell
+    if mins_since_exit < 30:
+        return False, f"cooldown {30 - mins_since_exit:.0f}m left"
+
+    # Rule 2: After a pump (max PnL > 20%), price must drop 25% from peak
+    if mem["max_pnl"] > 20:
+        peak = mem["peak_price"]
+        drop_from_peak = ((peak - current_price) / peak) * 100 if peak > 0 else 0
+        if drop_from_peak < 25:
+            return False, f"pump reentry: only {drop_from_peak:.0f}% off peak (need 25%)"
+
+    # Rule 3: After a loss, price must be below our original entry (avoid same level)
+    if mem["pnl"] < -5:
+        entry = mem["entry_price"]
+        if current_price >= entry * 0.85:
+            drop_from_entry = ((entry - current_price) / entry) * 100 if entry > 0 else 0
+            return False, f"loss reentry: price near old entry ({drop_from_entry:.0f}% below)"
+
+    return True, ""
 
 
 # Config for position management
@@ -900,7 +967,7 @@ async def buy_token(
     trade_type: str,
     current_price: float,
     market_cap: float,
-    sol_amount: float = MAX_POSITION_SOL,
+    sol_amount: float = 0.01,
     entry_metrics: Optional[TokenMetrics] = None
 ) -> Optional[LivePosition]:
     """Execute buy order with entry metrics capture."""
@@ -1127,6 +1194,7 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
 
     # Update session stats with actual SOL received
     update_session_sell(sol_received, pnl, pos.symbol)
+    record_trade_memory(pos)
 
     # Try to close empty token account to reclaim rent (~0.002 SOL)
     await close_token_account(pos.token_address)
@@ -1280,6 +1348,7 @@ async def manage_positions():
             save_positions(positions)
 
             closed_zero += 1
+            record_trade_memory(pos)
             print(f"  ${pos.symbol}: OPEN but 0 balance -> CLOSED (PnL {pnl:+.1f}%)")
             continue
 
@@ -1343,6 +1412,7 @@ async def manage_positions():
                             positions[i] = pos
                             break
                     save_positions(positions)
+                    record_trade_memory(pos)
                     update_session_sell(0, pnl_now, pos.symbol)  # Can't know exact SOL received
                     await send_tg(f"⚠️ *SELL (unconfirmed)* `{pos.symbol}`\nPnL: {pnl_now:+.1f}% | {reason}")
                 else:
@@ -1431,13 +1501,14 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     if step_percent <= 0:
         return False
 
-    # Calculate budget for this step
+    # Dynamic budget: recalculate from current wallet balance
+    trade_budget = await calc_trade_budget()
     wallet = get_wallet_pubkey()
     sol_balance = await get_sol_balance(wallet)
     usable_balance = max(0.0, sol_balance - MIN_FEE_RESERVE)
 
-    # Use same max position but scaled by step percentage
-    step_sol = min(MAX_POSITION_SOL * step_percent, usable_balance * 0.5)
+    # Step amount = trade budget * step percentage, capped at 50% of usable balance
+    step_sol = min(trade_budget * step_percent, usable_balance * 0.5)
 
     if step_sol < 0.001:
         print(f"DCA: Not enough balance for step {next_step}")
@@ -1656,7 +1727,13 @@ async def process_signal(signal: dict) -> bool:
         if p.token_address == token_address:
             return False
 
-    # 5. Trade count limit
+    # 5. Smart re-entry check (cooldown + price awareness after previous trades)
+    reentry_ok, reentry_reason = check_reentry_safe(token_address, price)
+    if not reentry_ok:
+        print(f"⛔ ${symbol}: re-entry blocked - {reentry_reason}")
+        return False
+
+    # 6. Trade count limit
     trade_count = count_trades_for_token(token_address)
     if trade_count >= MAX_TRADES_PER_TOKEN:
         print(f"Max trades reached for ${symbol} ({trade_count}/{MAX_TRADES_PER_TOKEN})")
@@ -1669,19 +1746,12 @@ async def process_signal(signal: dict) -> bool:
 
     # ===== READY TO BUY =====
 
-    # Calculate budget
-    wallet = get_wallet_pubkey()
-    sol_balance = await get_sol_balance(wallet)
-    usable_balance = max(0.0, sol_balance - MIN_FEE_RESERVE)
-    budget = usable_balance * WALLET_UTILIZATION
-    used = sum(p.sol_amount for p in open_positions)
-    available = max(0.0, budget - used)
-    remaining_slots = max(1, MAX_OPEN_TRADES - len(open_positions))
-    sol_amount = min(MAX_POSITION_SOL, available / remaining_slots)
+    # Dynamic position sizing: (wallet * 85%) / max_trades
+    trade_budget = await calc_trade_budget()
 
-    # ALL trades use step buying - first buy is only 15%
-    sol_amount = sol_amount * DCA_STEPS[0]  # 15% of normal position
-    print(f"DCA Step 1: {DCA_STEPS[0]*100:.0f}% = {sol_amount:.4f} SOL")
+    # Step 1 is 15% of full position budget
+    sol_amount = trade_budget * DCA_STEPS[0]
+    print(f"Trade budget: {trade_budget:.4f} SOL | Step 1: {DCA_STEPS[0]*100:.0f}% = {sol_amount:.4f} SOL")
 
     if sol_amount <= 0:
         print(f"No budget")
@@ -1781,10 +1851,21 @@ async def run_live_manager(interval_secs: int = 30):
         print("WARNING: No wallet configured!")
         print("Add your private key to keys.env")
 
+    # Load trade memory from existing closed positions (survives restarts)
+    positions = load_positions()
+    for p in positions:
+        if p.status == "CLOSED" and p.exit_time:
+            record_trade_memory(p)
+    if _TRADE_MEMORY:
+        print(f"Trade memory: {len(_TRADE_MEMORY)} tokens loaded")
+
     print(f"\nSession Log: logs/session_{SESSION_ID}.log")
 
+    # Show dynamic sizing
+    usable = max(0.0, (balance if wallet else 0) - MIN_FEE_RESERVE)
+    trade_budget = (usable * WALLET_UTILIZATION) / MAX_OPEN_TRADES
     print(f"\nConfig:")
-    print(f"  Max position: {MAX_POSITION_SOL} SOL | Max open: {MAX_OPEN_TRADES}")
+    print(f"  Sizing: dynamic ({WALLET_UTILIZATION*100:.0f}% wallet / {MAX_OPEN_TRADES} trades = ~{trade_budget:.4f} SOL/trade)")
     print(f"  DCA Steps: 15%/25%/60% at Entry/12%/28% dip")
     print(f"  Loss exits only after Step 3 complete")
     print(f"  Targets: Q=20% M=37% G=112% R=25%")
