@@ -770,16 +770,28 @@ MC_STALL_MINS = int(os.getenv("MC_STALL_MINS", "15"))               # Cut if MC 
 VOL_DECAY_THRESHOLD = float(os.getenv("VOL_DECAY_THRESHOLD", "0.2")) # Cut if vol drops to 20% of entry
 
 
+async def _jupiter_rate_wait():
+    """Enforce minimum interval between Jupiter API calls."""
+    import time
+    global _LAST_JUPITER_CALL
+    now = time.time()
+    elapsed = now - _LAST_JUPITER_CALL
+    if elapsed < JUPITER_MIN_INTERVAL:
+        await asyncio.sleep(JUPITER_MIN_INTERVAL - elapsed)
+    _LAST_JUPITER_CALL = time.time()
+
+
 async def get_jupiter_quote(
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int = MAX_SLIPPAGE_BPS
 ) -> Optional[dict]:
-    """Get swap quote from Jupiter with multi-endpoint fallback and rate limiting."""
-    import time
-    global _LAST_JUPITER_CALL
+    """Get swap quote from Jupiter. Returns (quote, endpoint_index) or None.
 
+    Tries multiple endpoints with retries. Returns the quote dict with
+    '_endpoint_idx' injected so execute_swap can use the same endpoint.
+    """
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -787,63 +799,64 @@ async def get_jupiter_quote(
         "slippageBps": slippage_bps,
     }
 
-    # Rate limiter: wait if we called Jupiter too recently
-    now = time.time()
-    elapsed = now - _LAST_JUPITER_CALL
-    if elapsed < JUPITER_MIN_INTERVAL:
-        wait = JUPITER_MIN_INTERVAL - elapsed
-        await asyncio.sleep(wait)
-
-    # Try each endpoint with retries
     for url_idx, quote_url in enumerate(JUPITER_QUOTE_URLS):
         for attempt in range(3):
             try:
-                _LAST_JUPITER_CALL = time.time()
+                await _jupiter_rate_wait()
                 async with aiohttp.ClientSession() as session:
                     async with session.get(quote_url, params=params, timeout=15) as resp:
                         if resp.status == 200:
-                            return await resp.json()
+                            data = await resp.json()
+                            data["_endpoint_idx"] = url_idx  # Track which endpoint worked
+                            return data
                         elif resp.status == 429:
-                            wait = 10 * (attempt + 1)  # 10s, 20s, 30s
+                            wait = 10 * (attempt + 1)
                             print(f"429 on {quote_url.split('/')[2]}, waiting {wait}s... ({attempt+1}/3)")
                             await asyncio.sleep(wait)
                             continue
                         elif resp.status == 401:
-                            print(f"401 on {quote_url.split('/')[2]}, trying next endpoint...")
-                            break  # Skip to next endpoint
+                            print(f"401 on {quote_url.split('/')[2]}, skipping...")
+                            break
                         else:
                             print(f"Quote error {resp.status} on {quote_url.split('/')[2]}")
-                            break  # Skip to next endpoint
+                            break
             except Exception as e:
                 print(f"Quote error on {quote_url.split('/')[2]}: {e}")
                 if attempt < 2:
                     await asyncio.sleep(5)
                     continue
-                break  # Try next endpoint
+                break
 
     print("Quote failed on all endpoints")
     return None
 
 
 async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
-    """Execute swap via Jupiter."""
+    """Execute swap via Jupiter. Uses same endpoint that provided the quote."""
     key_bytes, _ = load_keypair()
     if not key_bytes:
         print("ERROR: No valid private key configured!")
         return None
 
     try:
-        # Get swap transaction
+        # Use the same endpoint index that gave us the quote
+        preferred_idx = quote.pop("_endpoint_idx", 0)
         payload = {
             "quoteResponse": quote,
             "userPublicKey": wallet_pubkey,
             "wrapAndUnwrapSol": True,
         }
 
-        # Try each swap endpoint
+        # Try preferred endpoint first, then others
+        endpoint_order = [preferred_idx] + [i for i in range(len(JUPITER_SWAP_URLS)) if i != preferred_idx]
+
         swap_tx = None
-        for swap_url in JUPITER_SWAP_URLS:
+        for idx in endpoint_order:
+            if idx >= len(JUPITER_SWAP_URLS):
+                continue
+            swap_url = JUPITER_SWAP_URLS[idx]
             try:
+                await _jupiter_rate_wait()
                 async with aiohttp.ClientSession() as session:
                     async with session.post(swap_url, json=payload, timeout=15) as resp:
                         if resp.status == 429:
@@ -858,7 +871,7 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
                         try:
                             swap_data = json.loads(text)
                         except Exception:
-                            print(f"Swap API response (non-json): {text[:200]}")
+                            print(f"Swap response (non-json): {text[:200]}")
                             continue
                         swap_tx = swap_data.get("swapTransaction")
                         if swap_tx:
@@ -1032,23 +1045,30 @@ async def buy_token(
     # Track balance before swap (for accurate received amount)
     raw_before = await get_token_balance_raw(wallet, token_address)
 
-    # Get quote
-    quote = await get_jupiter_quote(SOL_MINT, token_address, lamports)
-    if not quote:
-        print("Failed to get quote")
-        return None
+    # Get quote + swap (retry with fresh quote if swap fails)
+    tx_hash = None
+    for swap_attempt in range(2):
+        quote = await get_jupiter_quote(SOL_MINT, token_address, lamports)
+        if not quote:
+            print("Failed to get quote")
+            return None
 
-    out_amount = int(quote.get("outAmount", 0))
-    if out_amount == 0:
-        print("Quote returned 0 tokens")
-        return None
+        out_amount = int(quote.get("outAmount", 0))
+        if out_amount == 0:
+            print("Quote returned 0 tokens")
+            return None
 
-    print(f"Quote: {out_amount} tokens")
+        print(f"Quote: {out_amount} tokens")
 
-    # Execute swap
-    tx_hash = await execute_swap(quote, wallet)
+        tx_hash = await execute_swap(quote, wallet)
+        if tx_hash:
+            break
+        if swap_attempt == 0:
+            print("Swap failed, retrying with fresh quote...")
+            await asyncio.sleep(3)
+
     if not tx_hash:
-        print("Swap failed!")
+        print("Swap failed after retry!")
         return None
 
     print(f"TX: {tx_hash}")
@@ -1169,27 +1189,30 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
         print(f"No token balance for {pos.symbol}, skipping sell")
         return False
 
-    # Get quote (sell tokens for SOL)
-    quote = await get_jupiter_quote(
-        pos.token_address,
-        SOL_MINT,
-        int(raw_amount)
-    )
-
-    if not quote:
-        print("Failed to get sell quote")
-        return False
-
-    sol_value = int(quote.get("outAmount", 0)) / 1_000_000_000
-    # Use total invested SOL (includes all DCA steps)
+    # Get quote + swap (retry with fresh quote if swap fails)
+    tx_hash = None
+    sol_value = 0
+    pnl = 0
     total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
-    pnl = ((sol_value - total_invested) / total_invested) * 100
-    print(f"PnL: {pnl:+.1f}% (out: {sol_value:.6f} / in: {total_invested:.6f} SOL)")
+    for swap_attempt in range(2):
+        quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount))
+        if not quote:
+            print("Failed to get sell quote")
+            return False
 
-    # Execute swap
-    tx_hash = await execute_swap(quote, wallet)
+        sol_value = int(quote.get("outAmount", 0)) / 1_000_000_000
+        pnl = ((sol_value - total_invested) / total_invested) * 100
+        print(f"PnL: {pnl:+.1f}% (out: {sol_value:.6f} / in: {total_invested:.6f} SOL)")
+
+        tx_hash = await execute_swap(quote, wallet)
+        if tx_hash:
+            break
+        if swap_attempt == 0:
+            print("Sell swap failed, retrying with fresh quote...")
+            await asyncio.sleep(3)
+
     if not tx_hash:
-        print("Sell failed!")
+        print("Sell failed after retry!")
         return False
 
     print(f"TX: {tx_hash}")
@@ -1567,21 +1590,28 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     # Track balance before
     raw_before = await get_token_balance_raw(wallet, pos.token_address)
 
-    # Get quote
-    quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports)
-    if not quote:
-        print("DCA: Failed to get quote")
-        return False
+    # Get quote + swap (retry with fresh quote if swap fails)
+    tx_hash = None
+    for swap_attempt in range(2):
+        quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports)
+        if not quote:
+            print("DCA: Failed to get quote")
+            return False
 
-    out_amount = int(quote.get("outAmount", 0))
-    if out_amount == 0:
-        print("DCA: Quote returned 0 tokens")
-        return False
+        out_amount = int(quote.get("outAmount", 0))
+        if out_amount == 0:
+            print("DCA: Quote returned 0 tokens")
+            return False
 
-    # Execute swap
-    tx_hash = await execute_swap(quote, wallet)
+        tx_hash = await execute_swap(quote, wallet)
+        if tx_hash:
+            break
+        if swap_attempt == 0:
+            print("DCA: Swap failed, retrying with fresh quote...")
+            await asyncio.sleep(3)
+
     if not tx_hash:
-        print("DCA: Swap failed!")
+        print("DCA: Swap failed after retry!")
         return False
 
     print(f"DCA TX: {tx_hash}")
