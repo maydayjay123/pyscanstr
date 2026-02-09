@@ -787,7 +787,7 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
         lines.append("")
         lines.append("*⚡ QUICK* (8%+)")
         for s in quick[:3]:
-            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction}")
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction} | *{s.score}pts*")
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
@@ -795,7 +795,7 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
         lines.append("")
         lines.append("*📈 MOMENTUM* (25%+)")
         for s in momentum[:3]:
-            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction}")
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction} | *{s.score}pts*")
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
@@ -803,7 +803,7 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
         lines.append("")
         lines.append("*💎 GEM* (100%+)")
         for s in gems[:3]:
-            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction}")
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction} | *{s.score}pts*")
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
@@ -811,7 +811,7 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
         lines.append("")
         lines.append("*📊 RANGE* (20%+ DCA)")
         for s in ranges[:3]:
-            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x | 24h+")
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x | 24h+ | *{s.score}pts*")
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
@@ -820,7 +820,7 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
         lines.append("")
         lines.append("*WATCH*")
         for s in watches[:5]:
-            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction}")
+            lines.append(f"`{s.symbol}` {s.mc_str} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.score}pts")
             lines.append(f"  {s.reason}")
             lines.append(f"  [chart]({s.chart})")
 
