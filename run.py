@@ -155,6 +155,17 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    try:
+        await _handle_button(query, data)
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            pass  # Content unchanged, ignore
+        else:
+            print(f"Button error: {e}")
+
+
+async def _handle_button(query, data):
+    """Process button callback data."""
     if data == "menu":
         msg = "*🚀 MEME TRADER*\n\n"
         msg += "Select an option:"
@@ -165,7 +176,7 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "positions":
-        from live_trader import load_positions, get_token_metrics, get_wallet_pubkey, get_token_balance_raw, get_token_value_sol
+        from live_trader import load_positions, get_token_metrics
 
         positions = load_positions()
         open_pos = [p for p in positions if p.status == "OPEN"]
@@ -174,7 +185,6 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             msg = "*📊 POSITIONS*\n\n"
             msg += "No open positions"
         else:
-            wallet = get_wallet_pubkey()
             msg = f"*📊 POSITIONS* ({len(open_pos)} open)\n\n"
 
             total_pnl = 0.0
@@ -184,12 +194,8 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 held_mins = (datetime.now() - entry).total_seconds() / 60
 
                 if metrics and metrics.price > 0:
-                    raw_amount = await get_token_balance_raw(wallet, p.token_address)
-                    sol_value = await get_token_value_sol(p.token_address, raw_amount)
-                    if sol_value and p.sol_amount > 0:
-                        pnl = ((sol_value - p.sol_amount) / p.sol_amount) * 100
-                    else:
-                        pnl = ((metrics.price - p.entry_price) / p.entry_price) * 100
+                    entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
+                    pnl = ((metrics.price - entry_price) / entry_price) * 100
 
                     total_pnl += pnl
 

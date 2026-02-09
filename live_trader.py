@@ -1277,12 +1277,13 @@ async def manage_positions():
             print(f"  ${pos.symbol}: OPEN but 0 balance -> CLOSED (PnL {pnl:+.1f}%)")
             continue
 
-        sol_value = await get_token_value_sol(pos.token_address, raw_amount)
-        if sol_value is None or pos.sol_amount <= 0:
+        # Use DexScreener price for PnL (saves Jupiter rate limit for actual swaps)
+        if not metrics or metrics.price <= 0 or pos.sol_amount <= 0:
             continue
         active_count += 1
 
-        pnl_now = ((sol_value - pos.sol_amount) / pos.sol_amount) * 100
+        entry_price = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
+        pnl_now = ((metrics.price - entry_price) / entry_price) * 100
         entry = datetime.fromisoformat(pos.entry_time)
         held_mins = (datetime.now() - entry).total_seconds() / 60
 
@@ -1911,13 +1912,9 @@ async def format_tg_position_update() -> str:
         held_mins = (datetime.now() - entry).total_seconds() / 60
 
         if metrics and metrics.price > 0:
-            # Get actual SOL value
-            raw_amount = await get_token_balance_raw(wallet, p.token_address)
-            sol_value = await get_token_value_sol(p.token_address, raw_amount)
-            if sol_value and p.sol_amount > 0:
-                pnl = ((sol_value - p.sol_amount) / p.sol_amount) * 100
-            else:
-                pnl = ((metrics.price - p.entry_price) / p.entry_price) * 100
+            # Use DexScreener price for PnL (saves Jupiter for actual swaps)
+            entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
+            pnl = ((metrics.price - entry_price) / entry_price) * 100
 
             total_pnl += pnl
 
