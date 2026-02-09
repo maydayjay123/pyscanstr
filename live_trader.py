@@ -1073,8 +1073,10 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
         return False
 
     sol_value = int(quote.get("outAmount", 0)) / 1_000_000_000
-    pnl = ((sol_value - pos.sol_amount) / pos.sol_amount) * 100
-    print(f"PnL: {pnl:+.1f}%")
+    # Use total invested SOL (includes all DCA steps)
+    total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+    pnl = ((sol_value - total_invested) / total_invested) * 100
+    print(f"PnL: {pnl:+.1f}% (out: {sol_value:.6f} / in: {total_invested:.6f} SOL)")
 
     # Execute swap
     tx_hash = await execute_swap(quote, wallet)
@@ -1087,10 +1089,15 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
 
     # VERIFY tokens were actually sold before marking CLOSED
     print("Verifying sell...")
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)
     remaining = await get_token_balance_raw(wallet, pos.token_address)
 
-    # If still have >10% of tokens, sell failed
+    # If still have >10% of tokens, wait longer and recheck
+    if remaining > raw_amount * 0.1:
+        print(f"Still have tokens, waiting 10s more...")
+        await asyncio.sleep(10)
+        remaining = await get_token_balance_raw(wallet, pos.token_address)
+
     if remaining > raw_amount * 0.1:
         print(f"WARNING: Sell may have failed! Still have {remaining} tokens (had {raw_amount})")
         print("Position NOT marked as closed - will retry")
@@ -1129,7 +1136,7 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     emoji = "🟢" if pnl >= 0 else "🔴"
     held_mins = (datetime.now() - datetime.fromisoformat(pos.entry_time)).total_seconds() / 60
     tg_msg = f"{emoji} *SELL* `{pos.symbol}` [{pos.trade_type}]\n"
-    tg_msg += f"PnL: *{pnl:+.1f}%* | SOL: {pos.sol_amount:.4f} → {sol_received:.4f}\n"
+    tg_msg += f"PnL: *{pnl:+.1f}%* | SOL: {total_invested:.4f} → {sol_received:.4f}\n"
     tg_msg += f"Held: {held_mins:.0f}m | {reason}\n"
     tg_msg += f"Session: {stats.wins}W/{stats.losses}L | Net: *{stats.net_pnl_sol:+.4f}* SOL\n"
     tg_msg += f"[TX](https://solscan.io/tx/{tx_hash})"
@@ -1390,6 +1397,19 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
 
     if dca_step >= 3:
         return False  # Already fully invested
+
+    # Minimum 5 minutes between DCA steps to avoid instant double-buys
+    if pos.dca_buys:
+        last_buy_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
+        mins_since_last = (datetime.now() - last_buy_time).total_seconds() / 60
+        if mins_since_last < 5:
+            return False  # Too soon after last step
+
+    # Also require minimum 2 minutes after initial entry
+    entry_time = datetime.fromisoformat(pos.entry_time)
+    mins_held = (datetime.now() - entry_time).total_seconds() / 60
+    if mins_held < 2:
+        return False  # Too soon after entry
 
     # IMPORTANT: Calculate dip from ORIGINAL entry price, not average
     # This ensures step 2 triggers at 12% below entry, step 3 at 28% below entry
