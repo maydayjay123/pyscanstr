@@ -123,9 +123,19 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
-# Jupiter API - lite is free, only used for actual swaps (not PnL checks)
-JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://lite-api.jup.ag/swap/v1/quote")
-JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://lite-api.jup.ag/swap/v1/swap")
+# Jupiter API - only used for actual swaps (not PnL checks)
+# Try multiple endpoints: lite-api (free) -> public community API as fallback
+JUPITER_QUOTE_URLS = [
+    "https://lite-api.jup.ag/swap/v1/quote",
+    "https://public.jupiterapi.com/quote",
+]
+JUPITER_SWAP_URLS = [
+    "https://lite-api.jup.ag/swap/v1/swap",
+    "https://public.jupiterapi.com/swap",
+]
+# Global rate limiter - minimum seconds between Jupiter calls
+_LAST_JUPITER_CALL = 0.0
+JUPITER_MIN_INTERVAL = 5  # seconds between calls
 
 # Position file
 POSITIONS_FILE = "live_positions.json"
@@ -766,34 +776,52 @@ async def get_jupiter_quote(
     amount: int,
     slippage_bps: int = MAX_SLIPPAGE_BPS
 ) -> Optional[dict]:
-    """Get swap quote from Jupiter with retry on rate limit."""
+    """Get swap quote from Jupiter with multi-endpoint fallback and rate limiting."""
+    import time
+    global _LAST_JUPITER_CALL
+
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount),
         "slippageBps": slippage_bps,
     }
-    for attempt in range(4):  # Up to 4 attempts
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        wait = (attempt + 1) * 3  # 3s, 6s, 9s, 12s
-                        print(f"Rate limited (429), waiting {wait}s... (attempt {attempt+1}/4)")
-                        await asyncio.sleep(wait)
-                        continue
-                    else:
-                        print(f"Quote error: {resp.status}")
-                        return None
-        except Exception as e:
-            print(f"Quote error: {e}")
-            if attempt < 3:
-                await asyncio.sleep(2)
-                continue
-            return None
-    print("Quote failed after 4 retries (rate limited)")
+
+    # Rate limiter: wait if we called Jupiter too recently
+    now = time.time()
+    elapsed = now - _LAST_JUPITER_CALL
+    if elapsed < JUPITER_MIN_INTERVAL:
+        wait = JUPITER_MIN_INTERVAL - elapsed
+        await asyncio.sleep(wait)
+
+    # Try each endpoint with retries
+    for url_idx, quote_url in enumerate(JUPITER_QUOTE_URLS):
+        for attempt in range(3):
+            try:
+                _LAST_JUPITER_CALL = time.time()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(quote_url, params=params, timeout=15) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                        elif resp.status == 429:
+                            wait = 10 * (attempt + 1)  # 10s, 20s, 30s
+                            print(f"429 on {quote_url.split('/')[2]}, waiting {wait}s... ({attempt+1}/3)")
+                            await asyncio.sleep(wait)
+                            continue
+                        elif resp.status == 401:
+                            print(f"401 on {quote_url.split('/')[2]}, trying next endpoint...")
+                            break  # Skip to next endpoint
+                        else:
+                            print(f"Quote error {resp.status} on {quote_url.split('/')[2]}")
+                            break  # Skip to next endpoint
+            except Exception as e:
+                print(f"Quote error on {quote_url.split('/')[2]}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(5)
+                    continue
+                break  # Try next endpoint
+
+    print("Quote failed on all endpoints")
     return None
 
 
@@ -812,24 +840,37 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
             "wrapAndUnwrapSol": True,
         }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
-                if resp.status != 200:
-                    print(f"Swap API error: {resp.status}")
-                    return None
+        # Try each swap endpoint
+        swap_tx = None
+        for swap_url in JUPITER_SWAP_URLS:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(swap_url, json=payload, timeout=15) as resp:
+                        if resp.status == 429:
+                            print(f"Swap 429 on {swap_url.split('/')[2]}, trying next...")
+                            await asyncio.sleep(10)
+                            continue
+                        if resp.status != 200:
+                            print(f"Swap API error {resp.status} on {swap_url.split('/')[2]}")
+                            continue
 
-                # Jupiter returns swapTransaction as base64.
-                text = await resp.text()
-                try:
-                    swap_data = json.loads(text)
-                except Exception:
-                    print(f"Swap API response (non-json): {text[:200]}")
-                    return False
-                swap_tx = swap_data.get("swapTransaction")
+                        text = await resp.text()
+                        try:
+                            swap_data = json.loads(text)
+                        except Exception:
+                            print(f"Swap API response (non-json): {text[:200]}")
+                            continue
+                        swap_tx = swap_data.get("swapTransaction")
+                        if swap_tx:
+                            break
+                        print("No swap transaction returned")
+            except Exception as e:
+                print(f"Swap error on {swap_url.split('/')[2]}: {e}")
+                continue
 
-                if not swap_tx:
-                    print("No swap transaction returned")
-                    return None
+        if not swap_tx:
+            print("Swap failed on all endpoints")
+            return None
 
         # Sign and send transaction
         # This requires solders/solana-py for signing
