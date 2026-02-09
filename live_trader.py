@@ -1228,27 +1228,27 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     dca_step = pos.dca_step if pos.dca_step else 1
     fully_invested = dca_step >= 3
 
-    # ===== PROFIT EXITS (always allowed) =====
-    # NOTE: Account for ~3% round-trip fees (buy + sell slippage/fees)
-    # Real profit = displayed PnL - 3%
+    # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
+    # IMPORTANT: All profit exits require pnl > 0 to prevent selling at a loss
+    # when price spikes then crashes between checks (meme volatility)
 
     # Target hit - always exit on target regardless of DCA step
     if pnl >= config["target"]:
         return f"TARGET {pnl:.1f}%"
 
     # Trailing profit - if we hit big gains and falling back
-    # Was 8%/4%, now 15%/6% (exit at ~9% = ~6% real after fees)
-    if pos.max_pnl_percent >= 15 and pnl <= (pos.max_pnl_percent - 6):
+    # Only fire if still in profit (>= 5% to cover fees)
+    if pos.max_pnl_percent >= 15 and pnl <= (pos.max_pnl_percent - 6) and pnl >= 5:
         return f"TRAIL {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
 
     # Quick profit lock - if we hit good profit and dropping
-    # Was 6%/3%, now 12%/8% (exit at ~8% = ~5% real after fees)
-    if pos.max_pnl_percent >= 12 and pnl <= 8:
+    # Only fire if still in profit (>= 5% to cover fees)
+    if pos.max_pnl_percent >= 12 and pnl <= 8 and pnl >= 5:
         return f"PROFIT_LOCK {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
 
-    # Emergency save - if max was high and now low, save something
-    # Was 10%/0%, now 18%/6% (exit at ~6% = ~3% real after fees)
-    if pos.max_pnl_percent >= 18 and pnl <= 6:
+    # Emergency save - if max was very high and crashing, save something
+    # Only fire if still above breakeven (>= 3%)
+    if pos.max_pnl_percent >= 18 and pnl <= 6 and pnl >= 3:
         return f"EMERGENCY_SAVE {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
 
     # ===== LOSS EXITS (only after step 3 complete) =====
