@@ -724,20 +724,42 @@ def save_signals(signals: List[TokenSignal], filepath: str = "signals.json"):
     return len(data)
 
 
+_scan_msg_id = 0  # Track scanner message for edit-in-place
+
 async def send_tg(text: str):
-    """Send message to Telegram."""
+    """Send or edit scanner message to Telegram (single message, updated in place)."""
+    global _scan_msg_id
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json={
+            if _scan_msg_id:
+                # Try to edit existing message
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "message_id": _scan_msg_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True
+                }
+                async with session.post(url, json=payload, timeout=10) as resp:
+                    data = await resp.json()
+                    if data.get("ok") or "not modified" in data.get("description", ""):
+                        return  # Edit worked or content unchanged
+                    # Message deleted/too old - fall through to send new
+
+            # Send new message
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            async with session.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True
-            }, timeout=10)
+            }, timeout=10) as resp:
+                data = await resp.json()
+                _scan_msg_id = data.get("result", {}).get("message_id", 0)
     except:
         pass
 
@@ -869,10 +891,11 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
                     }
                     await live_buy(signal_data)
 
-            # Send to TG if any signals (BUY or WATCH)
+            # Send to TG if any signals (BUY or WATCH) - edits in place
             if send_to_tg and signals:
                 msg = format_signal_msg(signals)
                 if msg:
+                    msg += f"\n_Scanned: {datetime.now().strftime('%H:%M:%S')}_"
                     await send_tg(msg)
 
         except Exception as e:

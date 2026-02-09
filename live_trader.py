@@ -43,7 +43,7 @@ async def send_tg(text: str, reply_markup: dict = None) -> int:
 
 
 async def edit_tg(message_id: int, text: str, reply_markup: dict = None) -> bool:
-    """Edit an existing TG message. Returns True if successful."""
+    """Edit an existing TG message. Returns True if successful or unchanged."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return False
     try:
@@ -60,7 +60,14 @@ async def edit_tg(message_id: int, text: str, reply_markup: dict = None) -> bool
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=10) as resp:
                 data = await resp.json()
-                return data.get("ok", False)
+                if data.get("ok"):
+                    return True
+                # "message is not modified" = content same, still valid
+                desc = data.get("description", "")
+                if "not modified" in desc:
+                    return True
+                # Message was deleted or too old
+                return False
     except:
         return False
 
