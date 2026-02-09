@@ -1324,48 +1324,65 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         return None
 
     # ===== STEP 3 COMPLETE - NOW APPLY LOSS-BASED EXITS =====
+    # But give breathing room first - memes bounce fast after dips
+
+    # Calculate minutes since step 3 completed (grace period)
+    mins_since_step3 = 0
+    if pos.dca_buys and len(pos.dca_buys) >= 3:
+        step3_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
+        mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
 
     # For RANGE trades, use calmer exit logic
     if pos.trade_type == "RANGE":
-        # Hard stop at -30% (tighter than other types)
         if pnl <= config["stop"]:
             return f"RANGE STOP {pnl:.1f}%"
-
-        # Timeout (48h for RANGE)
         timeout = timedelta(hours=config["timeout_hours"])
         if datetime.now() - entry > timeout:
             return f"RANGE TIMEOUT {pnl:.1f}%"
-
-        # RANGE trades don't use aggressive momentum exits
         return None
 
-    # Non-RANGE trades: apply standard loss exits
-    # Stop loss
+    # Hard stop loss - always active (catastrophic protection)
     if pnl <= config["stop"]:
         return f"STOP {pnl:.1f}%"
 
-    # ===== MOMENTUM/VOLUME-BASED EXITS (only if losing) =====
-    # Only kick in after 5 mins - let position settle first
-    if metrics and held_mins >= 5:
-        # Volume dying - vol dropped to <20% of entry AND we're losing
+    # ===== GRACE PERIOD: 15 min after step 3, no loss exits =====
+    # Step 3 triggers at 28% dip - the bounce often comes within minutes
+    if mins_since_step3 < 15:
+        return None
+
+    # ===== "DEAD TRADE" SIGNALS (15-45 min after step 3) =====
+    # Use much wider thresholds - only exit if trade is truly dead
+    if metrics and mins_since_step3 >= 15:
+
+        # Volume completely dried up - nobody trading anymore
+        # Need vol < 10% of entry AND losing > 15%
+        if pos.entry_vol_5m > 0 and metrics.vol_5m < pos.entry_vol_5m * 0.10:
+            if pnl < -15:
+                return f"DEAD_VOL {pnl:.1f}% (vol {metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})"
+
+        # Heavy sustained dump - sellers overwhelm buyers AND deep loss
+        # Need sells > 3x buys AND losing > 20%
+        if metrics.sells_5m > metrics.buys_5m * 3 and pnl < -20:
+            return f"DUMP {pnl:.1f}% (sells {metrics.sells_5m} > 3x buys {metrics.buys_5m})"
+
+        # MC collapsed - dropped 50%+ from peak with no recovery after 30 min
+        current_mc = metrics.mc
+        if pos.max_mc > 0 and current_mc < pos.max_mc * 0.50:
+            if mins_since_step3 > 30 and pnl < -25:
+                return f"MC_DEAD {pnl:.1f}% (mc {current_mc/1000:.0f}K vs peak {pos.max_mc/1000:.0f}K)"
+
+    # ===== EXTENDED LOSS EXITS (45+ min after step 3) =====
+    # More standard thresholds but still wider than before
+    if metrics and mins_since_step3 >= 45:
+
+        # Volume decayed - vol < 20% entry AND losing > 10%
         if pos.entry_vol_5m > 0 and metrics.vol_5m < pos.entry_vol_5m * VOL_DECAY_THRESHOLD:
-            if pnl < -5:  # Only exit if losing >5%
+            if pnl < -10:
                 return f"VOL_DECAY {pnl:.1f}% (vol {metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})"
 
-        # Dump detection - heavy selling pressure (sells > 2x buys) AND significant loss
-        if metrics.sells_5m > metrics.buys_5m * 2 and pnl < -10:
-            return f"DUMP {pnl:.1f}% (sells {metrics.sells_5m} > 2x buys {metrics.buys_5m})"
-
-        # MC stall detection - MC dropped 15% from peak after 15 mins
-        current_mc = metrics.mc
-        if pos.max_mc > 0 and current_mc < pos.max_mc * 0.85:
-            if held_mins > 15 and pnl < 5:
-                return f"MC_STALL {pnl:.1f}% (mc {current_mc/1000:.0f}K vs peak {pos.max_mc/1000:.0f}K)"
-
-        # Quick trade specific: if down >15% and losing momentum after 15m, cut
-        if pos.trade_type == "QUICK" and held_mins > 15:
-            if pnl < -15 and metrics.buy_ratio < 0.8:
-                return f"QUICK_CUT {pnl:.1f}% ({held_mins:.0f}m, ratio {metrics.buy_ratio:.1f})"
+        # No buyers left - ratio < 0.5 AND significant loss
+        if metrics.buy_ratio < 0.5 and pnl < -15:
+            return f"NO_BUYERS {pnl:.1f}% (ratio {metrics.buy_ratio:.1f}x)"
 
     # Timeout
     timeout = timedelta(hours=config["timeout_hours"])
