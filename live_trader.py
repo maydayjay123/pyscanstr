@@ -700,22 +700,34 @@ async def get_jupiter_quote(
     amount: int,
     slippage_bps: int = MAX_SLIPPAGE_BPS
 ) -> Optional[dict]:
-    """Get swap quote from Jupiter."""
-    try:
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-            "slippageBps": slippage_bps,
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(JUPITER_QUOTE_API, params=params) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    print(f"Quote error: {resp.status}")
-    except Exception as e:
-        print(f"Quote error: {e}")
+    """Get swap quote from Jupiter with retry on rate limit."""
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": slippage_bps,
+    }
+    for attempt in range(4):  # Up to 4 attempts
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(JUPITER_QUOTE_API, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        wait = (attempt + 1) * 3  # 3s, 6s, 9s, 12s
+                        print(f"Rate limited (429), waiting {wait}s... (attempt {attempt+1}/4)")
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        print(f"Quote error: {resp.status}")
+                        return None
+        except Exception as e:
+            print(f"Quote error: {e}")
+            if attempt < 3:
+                await asyncio.sleep(2)
+                continue
+            return None
+    print("Quote failed after 4 retries (rate limited)")
     return None
 
 
@@ -1612,10 +1624,7 @@ async def process_signal(signal: dict) -> bool:
 
     print(f"✅ ${symbol}: ENTRY score {entry_score} | {' | '.join(entry_reasons)}")
 
-    # 3. Basic filters
-    if buy_ratio < MIN_BUY_RATIO:
-        print(f"Skip ${symbol}: buy ratio {buy_ratio:.2f} < {MIN_BUY_RATIO}")
-        return False
+    # 3. Basic filters (buy ratio already scored above, no duplicate filter)
     if liquidity < MIN_SIGNAL_LIQUIDITY:
         print(f"Skip ${symbol}: liq ${liquidity:,.0f} < ${MIN_SIGNAL_LIQUIDITY:,.0f}")
         return False
