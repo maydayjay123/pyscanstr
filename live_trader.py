@@ -124,10 +124,9 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
-# Jupiter API
-JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag/swap/v1")
-JUPITER_QUOTE_API = f"{JUPITER_BASE_URL}/quote"
-JUPITER_SWAP_API = f"{JUPITER_BASE_URL}/swap"
+# Jupiter API - use ultra endpoint (better rate limits than lite-api)
+JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://quote-api.jup.ag/v6/quote")
+JUPITER_SWAP_URL = os.getenv("JUPITER_SWAP_URL", "https://quote-api.jup.ag/v6/swap")
 
 # Position file
 POSITIONS_FILE = "live_positions.json"
@@ -710,7 +709,7 @@ async def get_jupiter_quote(
     for attempt in range(4):  # Up to 4 attempts
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(JUPITER_QUOTE_API, params=params) as resp:
+                async with session.get(JUPITER_QUOTE_URL, params=params) as resp:
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
@@ -747,7 +746,7 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(JUPITER_SWAP_API, json=payload) as resp:
+            async with session.post(JUPITER_SWAP_URL, json=payload) as resp:
                 if resp.status != 200:
                     print(f"Swap API error: {resp.status}")
                     return None
