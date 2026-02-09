@@ -1634,7 +1634,7 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     # Track balance before
     raw_before = await get_token_balance_raw(wallet, pos.token_address)
 
-    # Get quote + swap (retry with fresh quote if swap fails)
+    # Get quote + verify dip is REAL (not just stale DexScreener)
     tx_hash = None
     for swap_attempt in range(2):
         quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports)
@@ -1646,6 +1646,21 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         if out_amount == 0:
             print("DCA: Quote returned 0 tokens")
             return False
+
+        # Verify dip with Jupiter quote price (not DexScreener)
+        # Compare tokens-per-SOL: more tokens = cheaper price = real dip
+        if pos.dca_buys and len(pos.dca_buys) > 0:
+            step1_sol = pos.dca_buys[0]["sol"]
+            step1_tokens = pos.token_amount if dca_step == 1 else None
+            if step1_tokens and step1_sol > 0:
+                step1_tps = step1_tokens / step1_sol
+                quote_tps = out_amount / step_sol if step_sol > 0 else 0
+                if quote_tps > 0 and step1_tps > 0:
+                    quote_dip = ((quote_tps - step1_tps) / step1_tps) * 100  # +% = cheaper
+                    print(f"DCA quote verify: {quote_dip:+.1f}% cheaper than step 1 (need {required_dip}% dip)")
+                    if quote_dip < required_dip * 0.5:  # Quote must confirm at least half the required dip
+                        print(f"DCA ABORT: Jupiter price doesn't confirm dip (DexScreener was stale)")
+                        return False
 
         tx_hash = await execute_swap(quote, wallet)
         if tx_hash:
