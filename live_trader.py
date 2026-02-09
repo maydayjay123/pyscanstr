@@ -1292,6 +1292,10 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     dca_step = pos.dca_step if pos.dca_step else 1
     fully_invested = dca_step >= 3
 
+    # ===== MC FLOOR: Dead coin detection (always active, any DCA step) =====
+    if metrics and metrics.mc < 15000 and held_mins >= 5:
+        return f"MC_FLOOR {pnl:.1f}% (MC ${metrics.mc:,.0f} < $15K)"
+
     # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
     # IMPORTANT: All profit exits require pnl > 0 to prevent selling at a loss
     # when price spikes then crashes between checks (meme volatility)
@@ -1577,6 +1581,29 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     if dip_percent < required_dip:
         return False  # Not enough dip for this step
 
+    # ===== HEALTH CHECK: Don't throw money at a dying coin =====
+    if entry_metrics:
+        # MC collapsed below 15K = almost certainly dead
+        if current_mc < 15000:
+            print(f"DCA SKIP: ${pos.symbol} MC ${current_mc:,.0f} below 15K floor - dead coin")
+            return False
+
+        # MC never went above entry = no momentum at all, don't DCA deeper
+        if pos.max_mc > 0 and pos.max_mc <= pos.entry_mc * 1.05:
+            if next_step == 3:  # Only block step 3 (biggest allocation 60%)
+                print(f"DCA SKIP: ${pos.symbol} MC never pumped above entry (max {pos.max_mc:,.0f} vs entry {pos.entry_mc:,.0f})")
+                return False
+
+        # Volume completely dead = nobody trading
+        if pos.entry_vol_5m > 0 and entry_metrics.vol_5m < pos.entry_vol_5m * 0.10:
+            print(f"DCA SKIP: ${pos.symbol} volume dead ({entry_metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})")
+            return False
+
+        # Heavy selling pressure - don't buy into a dump
+        if entry_metrics.sells_5m > entry_metrics.buys_5m * 2.5:
+            print(f"DCA SKIP: ${pos.symbol} dump in progress (sells {entry_metrics.sells_5m} > 2.5x buys {entry_metrics.buys_5m})")
+            return False
+
     step_percent = DCA_STEPS[next_step - 1] if next_step <= len(DCA_STEPS) else 0
 
     if step_percent <= 0:
@@ -1649,21 +1676,38 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         # Still update position, tokens may arrive later
         actual_received = out_amount
 
+    # Calculate ACTUAL execution price from tokens received (not stale DexScreener)
+    actual_price = current_price  # fallback
+    if actual_received > 0 and pos.dca_buys and len(pos.dca_buys) > 0:
+        # Use step 1 as reference: compare tokens-per-SOL ratio
+        step1 = pos.dca_buys[0]
+        step1_sol = step1["sol"]
+        step1_price = step1["price"]
+        # For step 1, we know the token_amount and sol spent
+        if dca_step == 1:
+            step1_tps = pos.token_amount / step1_sol if step1_sol > 0 else 0
+        else:
+            # For step 3, use previous step's data
+            step1_tps = pos.token_amount / pos.dca_total_sol if pos.dca_total_sol > 0 else 0
+            step1_price = pos.dca_avg_price if pos.dca_avg_price > 0 else step1_price
+        this_tps = actual_received / step_sol if step_sol > 0 else 0
+        if step1_tps > 0 and this_tps > 0:
+            actual_price = step1_price * (step1_tps / this_tps)
+            print(f"DCA actual price: {actual_price:.10f} (DexScreener: {current_price:.10f})")
+
     # Update position with DCA info
     old_total_sol = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
     new_total_sol = old_total_sol + step_sol
     old_total_tokens = pos.token_amount
     new_total_tokens = old_total_tokens + actual_received
 
-    # Calculate new average price using proper weighted average
-    # avg_price = weighted average of entry prices by SOL spent
+    # Calculate new average price using ACTUAL execution price
     old_avg = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
-    # Formula: new_avg = (old_sol * old_price + new_sol * new_price) / total_sol
-    new_avg_price = ((old_total_sol * old_avg) + (step_sol * current_price)) / new_total_sol if new_total_sol > 0 else current_price
+    new_avg_price = ((old_total_sol * old_avg) + (step_sol * actual_price)) / new_total_sol if new_total_sol > 0 else actual_price
 
-    # Update DCA buys list
+    # Update DCA buys list with actual price
     dca_buys = pos.dca_buys or []
-    dca_buys.append({"sol": step_sol, "price": current_price, "time": datetime.now().isoformat(), "tx": tx_hash})
+    dca_buys.append({"sol": step_sol, "price": actual_price, "time": datetime.now().isoformat(), "tx": tx_hash})
 
     # Update position
     pos.dca_step = next_step
@@ -1803,9 +1847,14 @@ async def process_signal(signal: dict) -> bool:
 
     print(f"✅ ${symbol}: ENTRY score {entry_score} | {' | '.join(entry_reasons)}")
 
-    # 3. Basic filters (buy ratio already scored above, no duplicate filter)
+    # 3. Hard filters at entry time
     if liquidity < MIN_SIGNAL_LIQUIDITY:
         print(f"Skip ${symbol}: liq ${liquidity:,.0f} < ${MIN_SIGNAL_LIQUIDITY:,.0f}")
+        return False
+
+    # Minimum buy ratio - must have clear buying pressure to enter
+    if buy_ratio < 1.3:
+        print(f"Skip ${symbol}: buy ratio {buy_ratio:.2f}x too weak (need 1.3x+)")
         return False
 
     # 4. Check if already in position
