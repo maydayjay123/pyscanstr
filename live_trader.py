@@ -100,7 +100,7 @@ def get_trade_buttons():
     }
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-MAX_SLIPPAGE_BPS = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "5")) * 100)  # Convert to basis points
+MAX_SLIPPAGE_BPS = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "10")) * 100)  # 10% default for meme coins
 WALLET_UTILIZATION = float(os.getenv("WALLET_UTILIZATION", "0.85"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
 MIN_FEE_RESERVE = float(os.getenv("MIN_FEE_RESERVE", "0.005"))  # Always keep this much SOL for fees
@@ -1296,7 +1296,7 @@ async def buy_token(
     # Get quote + swap (retry with fresh quote + higher slippage if fails)
     tx_hash = None
     for swap_attempt in range(2):
-        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)  # 15% on retry
         quote = await get_jupiter_quote(SOL_MINT, token_address, lamports, slippage)
         if not quote:
             print("Failed to get quote")
@@ -1444,7 +1444,7 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     pnl = 0
     total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
     for swap_attempt in range(2):
-        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)  # 15% on retry
         quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount), slippage)
         if not quote:
             print("Failed to get sell quote")
@@ -1910,7 +1910,7 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     # Get quote + verify dip is REAL (not just stale DexScreener)
     tx_hash = None
     for swap_attempt in range(2):
-        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)  # 15% on retry
         quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports, slippage)
         if not quote:
             print("DCA: Failed to get quote")
