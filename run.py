@@ -41,6 +41,7 @@ def get_main_menu():
         ],
         [
             InlineKeyboardButton("💀 SELL WALLET", callback_data="sell_wallet_confirm"),
+            InlineKeyboardButton("📋 Export CSV", callback_data="export_csv"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -438,6 +439,65 @@ async def _handle_button(query, data):
             parse_mode="Markdown",
             reply_markup=get_back_menu()
         )
+
+    elif data == "export_csv":
+        from live_trader import load_positions
+        import io
+
+        positions = load_positions()
+        closed = [p for p in positions if p.status == "CLOSED"]
+        open_pos = [p for p in positions if p.status == "OPEN"]
+
+        if not closed and not open_pos:
+            await query.edit_message_text("No trade data to export", reply_markup=get_back_menu())
+        else:
+            # Build CSV
+            csv_lines = ["status,symbol,trade_type,entry_time,exit_time,held_mins,entry_mc,max_mc,sol_invested,pnl_pct,max_pnl_pct,exit_reason,dca_steps,tx_hash"]
+            all_trades = closed + open_pos
+            all_trades.sort(key=lambda p: p.entry_time, reverse=True)
+
+            for p in all_trades:
+                entry_dt = datetime.fromisoformat(p.entry_time)
+                if p.exit_time:
+                    exit_dt = datetime.fromisoformat(p.exit_time)
+                    held = (exit_dt - entry_dt).total_seconds() / 60
+                    exit_str = exit_dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    held = (datetime.now() - entry_dt).total_seconds() / 60
+                    exit_str = ""
+
+                sol_in = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
+                steps = p.dca_step if p.dca_step else 1
+                reason = (p.exit_reason or "").replace(",", ";")
+
+                csv_lines.append(
+                    f"{p.status},{p.symbol},{p.trade_type},"
+                    f"{entry_dt.strftime('%Y-%m-%d %H:%M')},{exit_str},"
+                    f"{held:.0f},{p.entry_mc:.0f},{p.max_mc:.0f},"
+                    f"{sol_in:.6f},{p.pnl_percent:.2f},{p.max_pnl_percent:.2f},"
+                    f"{reason},{steps},{p.tx_hash or ''}"
+                )
+
+            csv_content = "\n".join(csv_lines)
+
+            # Send as document via TG API
+            try:
+                import aiohttp as aio
+                csv_bytes = csv_content.encode("utf-8")
+                form = aio.FormData()
+                form.add_field("chat_id", str(TELEGRAM_CHAT_ID))
+                form.add_field("document", csv_bytes, filename=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", content_type="text/csv")
+                form.add_field("caption", f"Trade export: {len(closed)} closed, {len(open_pos)} open")
+
+                async with aio.ClientSession() as session:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+                    async with session.post(url, data=form, timeout=15) as resp:
+                        if resp.status == 200:
+                            await query.edit_message_text(f"Exported {len(all_trades)} trades as CSV", reply_markup=get_back_menu())
+                        else:
+                            await query.edit_message_text("Export failed - TG API error", reply_markup=get_back_menu())
+            except Exception as e:
+                await query.edit_message_text(f"Export error: {e}", reply_markup=get_back_menu())
 
     elif data == "sell_all_confirm":
         from live_trader import load_positions

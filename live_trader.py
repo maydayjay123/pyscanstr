@@ -361,10 +361,10 @@ def format_alltime_stats() -> str:
 
 # Trade type configs (same as sim)
 TRADE_CONFIGS = {
-    "QUICK": {"target": 20, "stop": -85, "timeout_hours": 2},
-    "MOMENTUM": {"target": 37, "stop": -85, "timeout_hours": 6},
-    "GEM": {"target": 112, "stop": -85, "timeout_hours": 24},
-    "RANGE": {"target": 25, "stop": -30, "timeout_hours": 48},  # Higher TP, tighter stop
+    "QUICK": {"target": 20, "stop": -45, "timeout_hours": 2},
+    "MOMENTUM": {"target": 37, "stop": -45, "timeout_hours": 6},
+    "GEM": {"target": 112, "stop": -55, "timeout_hours": 24},
+    "RANGE": {"target": 25, "stop": -30, "timeout_hours": 48},
 }
 
 # DCA step buying for ALL trades
@@ -1153,11 +1153,27 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
             sigs[signer_index] = sig
             tx = VersionedTransaction.populate(tx.message, sigs)
 
-            # Send transaction
+            # Send transaction and confirm it landed
             async with AsyncClient(SOLANA_RPC_URL) as client:
                 result = await client.send_raw_transaction(bytes(tx))
                 if result.value:
-                    return str(result.value)
+                    tx_sig = str(result.value)
+                    # Wait for confirmation (up to 30s)
+                    for confirm_attempt in range(15):
+                        await asyncio.sleep(2)
+                        try:
+                            status = await client.get_signature_statuses([result.value])
+                            if status.value and status.value[0]:
+                                if status.value[0].err:
+                                    print(f"TX confirmed but FAILED on-chain: {status.value[0].err}")
+                                    return None
+                                print(f"TX confirmed on-chain")
+                                return tx_sig
+                        except:
+                            continue
+                    # Not confirmed after 30s - return hash anyway, balance check will verify
+                    print(f"TX sent but not confirmed after 30s (may still land)")
+                    return tx_sig
 
         except ImportError:
             print("ERROR: Install solders and solana-py:")
@@ -1526,6 +1542,11 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if metrics and metrics.mc < 15000 and held_mins >= 5:
         return f"MC_FLOOR {pnl:.1f}% (MC ${metrics.mc:,.0f} < $15K)"
 
+    # MC never grew above entry after 20 min = no momentum, cut early
+    if metrics and held_mins >= 20 and pos.max_mc > 0:
+        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -5:
+            return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
+
     # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
     # IMPORTANT: All profit exits require pnl > 0 to prevent selling at a loss
     # when price spikes then crashes between checks (meme volatility)
@@ -1549,10 +1570,28 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if pos.max_pnl_percent >= 18 and pnl <= 6 and pnl >= 3:
         return f"EMERGENCY_SAVE {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
 
-    # ===== LOSS EXITS (only after step 3 complete) =====
+    # ===== LOSS EXITS BEFORE FULLY INVESTED =====
     if not fully_invested:
-        # Before step 3: Don't exit on losses - we're still DCA'ing in
-        # Only allow timeout after very long time (24h+) even without step 3
+        # Hard stop always applies even during DCA
+        if pnl <= config["stop"]:
+            return f"STOP {pnl:.1f}% (step {dca_step})"
+
+        # Step 1 only (15% invested): cut early if going nowhere
+        if dca_step == 1:
+            # 30+ mins at step 1 and losing > 8%: won't recover without DCA
+            if held_mins >= 30 and pnl < -8:
+                return f"STEP1_CUT {pnl:.1f}% ({held_mins:.0f}m, no DCA triggered)"
+            # 60+ mins at step 1 and any loss: probably dead
+            if held_mins >= 60 and pnl < -3:
+                return f"STEP1_STALE {pnl:.1f}% ({held_mins:.0f}m)"
+
+        # Step 2 (40% invested): tighter timeout
+        if dca_step == 2:
+            # 45+ mins since entry and losing > 15%: don't throw 60% more at it
+            if held_mins >= 45 and pnl < -15:
+                return f"STEP2_CUT {pnl:.1f}% ({held_mins:.0f}m)"
+
+        # Timeout after very long time
         if held_mins > 1440:  # 24 hours
             return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
         return None
@@ -1917,9 +1956,15 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         actual_received = max(0, raw_after - raw_before)
 
     if actual_received == 0:
-        print(f"DCA: Warning - no tokens confirmed after buy")
-        # Still update position, tokens may arrive later
-        actual_received = out_amount
+        # Final check after extra delay
+        await asyncio.sleep(10)
+        raw_after = await get_token_balance_raw(wallet, pos.token_address)
+        actual_received = max(0, raw_after - raw_before)
+
+    if actual_received == 0:
+        print(f"DCA FAILED: No tokens received after 25s! TX may have failed on-chain.")
+        await send_tg(f"⚠️ *DCA FAILED* `{pos.symbol}` Step {next_step}\nNo tokens after 25s!\n[Check TX](https://solscan.io/tx/{tx_hash})")
+        return False
 
     # Calculate ACTUAL execution price from tokens received (not stale DexScreener)
     actual_price = current_price  # fallback
