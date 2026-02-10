@@ -1017,10 +1017,10 @@ async def get_jupiter_quote(
     amount: int,
     slippage_bps: int = MAX_SLIPPAGE_BPS
 ) -> Optional[dict]:
-    """Get swap quote from Jupiter. Returns (quote, endpoint_index) or None.
+    """Get swap quote from Jupiter. Returns quote dict with '_endpoint_idx' or None.
 
-    Tries multiple endpoints with retries. Returns the quote dict with
-    '_endpoint_idx' injected so execute_swap can use the same endpoint.
+    Tries ALL endpoints first before retrying any - so fallback kicks in fast.
+    Round 1: try each endpoint once (no wait). Round 2-3: try each with backoff.
     """
     params = {
         "inputMint": input_mint,
@@ -1029,35 +1029,36 @@ async def get_jupiter_quote(
         "slippageBps": slippage_bps,
     }
 
-    for url_idx, quote_url in enumerate(JUPITER_QUOTE_URLS):
-        for attempt in range(3):
+    for round_num in range(3):
+        if round_num > 0:
+            wait = 10 * round_num
+            print(f"All endpoints 429, waiting {wait}s... (round {round_num+1}/3)")
+            await asyncio.sleep(wait)
+
+        for url_idx, quote_url in enumerate(JUPITER_QUOTE_URLS):
             try:
                 await _jupiter_rate_wait()
                 async with aiohttp.ClientSession() as session:
                     async with session.get(quote_url, params=params, timeout=15) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            data["_endpoint_idx"] = url_idx  # Track which endpoint worked
+                            data["_endpoint_idx"] = url_idx
                             return data
                         elif resp.status == 429:
-                            wait = 10 * (attempt + 1)
-                            print(f"429 on {quote_url.split('/')[2]}, waiting {wait}s... ({attempt+1}/3)")
-                            await asyncio.sleep(wait)
-                            continue
+                            host = quote_url.split('/')[2]
+                            print(f"429 on {host}, trying next endpoint...")
+                            continue  # Try next endpoint immediately
                         elif resp.status == 401:
                             print(f"401 on {quote_url.split('/')[2]}, skipping...")
-                            break
+                            continue
                         else:
                             print(f"Quote error {resp.status} on {quote_url.split('/')[2]}")
-                            break
+                            continue
             except Exception as e:
                 print(f"Quote error on {quote_url.split('/')[2]}: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(5)
-                    continue
-                break
+                continue
 
-    print("Quote failed on all endpoints")
+    print("Quote failed on all endpoints after 3 rounds")
     return None
 
 
@@ -1091,7 +1092,6 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
                     async with session.post(swap_url, json=payload, timeout=15) as resp:
                         if resp.status == 429:
                             print(f"Swap 429 on {swap_url.split('/')[2]}, trying next...")
-                            await asyncio.sleep(10)
                             continue
                         if resp.status != 200:
                             print(f"Swap API error {resp.status} on {swap_url.split('/')[2]}")
