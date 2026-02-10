@@ -468,7 +468,7 @@ async def _handle_button(query, data):
 
                 sol_in = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
                 steps = p.dca_step if p.dca_step else 1
-                reason = (p.exit_reason or "").replace(",", ";")
+                reason = (getattr(p, 'exit_reason', '') or "").replace(",", ";")
 
                 csv_lines.append(
                     f"{p.status},{p.symbol},{p.trade_type},"
