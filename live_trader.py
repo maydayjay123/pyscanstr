@@ -659,9 +659,10 @@ RAYDIUM_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 METEORA_DLMM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 METEORA_DYNAMIC = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB"
 PUMPFUN_AMM = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
-SUPPORTED_POOL_PROGRAMS = {RAYDIUM_AMM_V4, METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM}
-# Programs that use vaults-after-mints layout (Meteora + PumpFun AMM)
-_VAULTS_AFTER_MINTS = {METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM}
+PUMPFUN_AMM_V2 = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+SUPPORTED_POOL_PROGRAMS = {RAYDIUM_AMM_V4, METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM, PUMPFUN_AMM_V2}
+# Programs that use vaults-after-mints layout
+_VAULTS_AFTER_MINTS = {METEORA_DLMM, METEORA_DYNAMIC, PUMPFUN_AMM, PUMPFUN_AMM_V2}
 _POOL_CACHE = {}  # {token_address: {"pool_addr", "coin_vault", "sol_vault"}}
 _SOL_USD_PRICE = 0.0
 _SOL_USD_LAST = 0.0
@@ -802,7 +803,7 @@ async def _decode_pool_vaults(pool_addr: str, token_address: str) -> Optional[di
                     else:
                         sol_vault, coin_vault = v1, v2
 
-                pool_type = "Raydium" if owner == RAYDIUM_AMM_V4 else "PumpFun" if owner == PUMPFUN_AMM else "Meteora"
+                pool_type = "Raydium" if owner == RAYDIUM_AMM_V4 else "PumpFun" if owner in (PUMPFUN_AMM, PUMPFUN_AMM_V2) else "Meteora"
                 print(f"Pool decoded ({pool_type}): coin={coin_vault[:8]}... sol={sol_vault[:8]}...")
                 return {"coin_vault": coin_vault, "sol_vault": sol_vault}
     except Exception as e:
@@ -1087,7 +1088,8 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
                 continue
             swap_url = JUPITER_SWAP_URLS[idx]
             try:
-                await _jupiter_rate_wait()
+                # NO rate wait here - swap must fire immediately after quote
+                # The quote already did the rate wait
                 async with aiohttp.ClientSession() as session:
                     async with session.post(swap_url, json=payload, timeout=15) as resp:
                         if resp.status == 429:
@@ -1291,10 +1293,11 @@ async def buy_token(
     # Track balance before swap (for accurate received amount)
     raw_before = await get_token_balance_raw(wallet, token_address)
 
-    # Get quote + swap (retry with fresh quote if swap fails)
+    # Get quote + swap (retry with fresh quote + higher slippage if fails)
     tx_hash = None
     for swap_attempt in range(2):
-        quote = await get_jupiter_quote(SOL_MINT, token_address, lamports)
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        quote = await get_jupiter_quote(SOL_MINT, token_address, lamports, slippage)
         if not quote:
             print("Failed to get quote")
             return None
@@ -1310,8 +1313,8 @@ async def buy_token(
         if tx_hash:
             break
         if swap_attempt == 0:
-            print("Swap failed, retrying with fresh quote...")
-            await asyncio.sleep(3)
+            print("Swap failed, retrying with higher slippage...")
+            await asyncio.sleep(2)
 
     if not tx_hash:
         print("Swap failed after retry!")
@@ -1435,13 +1438,14 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
         print(f"No token balance for {pos.symbol}, skipping sell")
         return False
 
-    # Get quote + swap (retry with fresh quote if swap fails)
+    # Get quote + swap (retry with fresh quote + higher slippage if fails)
     tx_hash = None
     sol_value = 0
     pnl = 0
     total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
     for swap_attempt in range(2):
-        quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount))
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount), slippage)
         if not quote:
             print("Failed to get sell quote")
             return False
@@ -1454,8 +1458,8 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
         if tx_hash:
             break
         if swap_attempt == 0:
-            print("Sell swap failed, retrying with fresh quote...")
-            await asyncio.sleep(3)
+            print("Sell swap failed, retrying with higher slippage...")
+            await asyncio.sleep(2)
 
     if not tx_hash:
         print("Sell failed after retry!")
@@ -1906,7 +1910,8 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
     # Get quote + verify dip is REAL (not just stale DexScreener)
     tx_hash = None
     for swap_attempt in range(2):
-        quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports)
+        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.5)
+        quote = await get_jupiter_quote(SOL_MINT, pos.token_address, lamports, slippage)
         if not quote:
             print("DCA: Failed to get quote")
             return False
@@ -1935,8 +1940,8 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         if tx_hash:
             break
         if swap_attempt == 0:
-            print("DCA: Swap failed, retrying with fresh quote...")
-            await asyncio.sleep(3)
+            print("DCA: Swap failed, retrying with higher slippage...")
+            await asyncio.sleep(2)
 
     if not tx_hash:
         print("DCA: Swap failed after retry!")
