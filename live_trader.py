@@ -624,10 +624,42 @@ async def get_token_balance_raw(pubkey: str, mint: str) -> int:
     return 0
 
 
+async def get_token_balance_full(pubkey: str, mint: str) -> tuple:
+    """Get raw AND human-readable token balance. Returns (raw_amount, ui_amount)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            for program_id in (SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [
+                        pubkey,
+                        {"programId": program_id},
+                        {"encoding": "jsonParsed"},
+                    ],
+                }
+                async with session.post(SOLANA_RPC_URL, json=payload) as resp:
+                    data = await resp.json()
+                    accounts = data.get("result", {}).get("value", [])
+                    for acc in accounts:
+                        info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        if info.get("mint") != mint:
+                            continue
+                        token_amount = info.get("tokenAmount", {})
+                        raw = int(token_amount.get("amount", "0"))
+                        ui = float(token_amount.get("uiAmount", 0) or 0)
+                        return (raw, ui)
+    except Exception:
+        return (0, 0.0)
+    return (0, 0.0)
+
+
 @dataclass
 class TokenMetrics:
     """Live token metrics from DexScreener."""
     price: float = 0.0
+    price_sol: float = 0.0  # Price in SOL (for SOL-based PnL)
     mc: float = 0.0
     vol_5m: float = 0.0
     vol_1h: float = 0.0
@@ -908,11 +940,20 @@ async def get_token_metrics(token_address: str, retries: int = 3) -> Optional[To
                                     if pool and pool["price_usd"] > 0:
                                         dex_price = metrics.price
                                         metrics.price = pool["price_usd"]
+                                        metrics.price_sol = pool["price_sol"]
                                         # Recalculate MC from pool price if we have DexScreener's FDV ratio
                                         if dex_price > 0 and metrics.mc > 0:
                                             metrics.mc = metrics.mc * (pool["price_usd"] / dex_price)
                                 except:
                                     pass  # Fall back to DexScreener price
+                                # Ensure price_sol is set even without pool
+                                if metrics.price_sol <= 0 and metrics.price > 0:
+                                    try:
+                                        sol_usd = await get_sol_usd_price()
+                                        if sol_usd > 0:
+                                            metrics.price_sol = metrics.price / sol_usd
+                                    except:
+                                        pass
                                 return metrics
         except Exception as e:
             if attempt < retries - 1:
@@ -1527,6 +1568,19 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     return True
 
 
+def compute_pnl_sol(total_sol_invested: float, ui_token_balance: float, price_sol: float) -> float:
+    """Compute PnL using SOL-based calculation.
+
+    Uses ground truth values (actual SOL spent, actual tokens held) and
+    current market price to compute PnL. Immune to price source mismatch
+    between entry (DexScreener) and monitoring (pool price engine).
+    """
+    if total_sol_invested <= 0 or price_sol <= 0:
+        return 0.0
+    current_value_sol = ui_token_balance * price_sol
+    return ((current_value_sol - total_sol_invested) / total_sol_invested) * 100
+
+
 def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[TokenMetrics] = None) -> Optional[str]:
     """Check if position should be closed with enhanced logic.
 
@@ -1687,14 +1741,14 @@ async def manage_positions():
         if not metrics:
             continue
 
-        raw_amount = await get_token_balance_raw(wallet, pos.token_address)
+        raw_amount, ui_balance = await get_token_balance_full(wallet, pos.token_address)
         if raw_amount <= 0:
-            # Auto-close phantom positions (no on-chain balance)
-            current_price = metrics.price if metrics else 0
-            pnl = ((current_price - pos.entry_price) / pos.entry_price) * 100 if current_price > 0 else -100
+            # Auto-close phantom positions (no on-chain balance) - tokens gone = -100%
+            total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+            pnl = -100.0
 
             pos.status = "CLOSED"
-            pos.exit_price = current_price
+            pos.exit_price = metrics.price if metrics else 0
             pos.exit_time = datetime.now().isoformat()
             pos.exit_tx = "BALANCE_ZERO"
             pos.pnl_percent = pnl
@@ -1710,13 +1764,20 @@ async def manage_positions():
             print(f"  ${pos.symbol}: OPEN but 0 balance -> CLOSED (PnL {pnl:+.1f}%)")
             continue
 
-        # Use DexScreener price for PnL (saves Jupiter rate limit for actual swaps)
-        if not metrics or metrics.price <= 0 or pos.sol_amount <= 0:
+        # SOL-based PnL: uses actual SOL invested + actual tokens held + current price
+        if not metrics or pos.sol_amount <= 0:
+            continue
+        if metrics.price_sol <= 0 and metrics.price <= 0:
             continue
         active_count += 1
 
-        entry_price = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
-        pnl_now = ((metrics.price - entry_price) / entry_price) * 100
+        total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+        if metrics.price_sol > 0 and ui_balance > 0:
+            pnl_now = compute_pnl_sol(total_invested, ui_balance, metrics.price_sol)
+        else:
+            # Fallback: price-based (only if SOL price unavailable)
+            entry_price = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
+            pnl_now = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
         entry = datetime.fromisoformat(pos.entry_time)
         held_mins = (datetime.now() - entry).total_seconds() / 60
 
@@ -2355,6 +2416,8 @@ async def format_live_status_detailed() -> str:
     msg = "*LIVE POSITIONS (DETAILED)*\n"
     msg += "=" * 25 + "\n\n"
 
+    wallet = get_wallet_pubkey()
+
     if not open_pos:
         msg += "No open positions\n"
     else:
@@ -2368,9 +2431,14 @@ async def format_live_status_detailed() -> str:
             msg += f"*${p.symbol}* [{p.trade_type}]\n"
 
             if metrics and metrics.price:
-                # For RANGE trades with DCA, use avg price for PnL
-                entry_price = p.dca_avg_price if p.dca_avg_price > 0 else p.entry_price
-                pnl = ((metrics.price - entry_price) / entry_price) * 100
+                # SOL-based PnL
+                total_sol = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
+                if metrics.price_sol > 0:
+                    _, ui_bal = await get_token_balance_full(wallet, p.token_address)
+                    pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
+                else:
+                    entry_price = p.dca_avg_price if p.dca_avg_price > 0 else p.entry_price
+                    pnl = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 mc_str = f"{metrics.mc/1000:.0f}K" if metrics.mc < 1_000_000 else f"{metrics.mc/1_000_000:.1f}M"
                 trend = "[+]" if metrics.change_5m > 0 else "[-]" if metrics.change_5m < -5 else "[=]"
 
@@ -2444,9 +2512,14 @@ async def format_tg_position_update() -> str:
         held_mins = (datetime.now() - entry).total_seconds() / 60
 
         if metrics and metrics.price > 0:
-            # Use DexScreener price for PnL (saves Jupiter for actual swaps)
-            entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
-            pnl = ((metrics.price - entry_price) / entry_price) * 100
+            # SOL-based PnL
+            total_sol = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
+            if metrics.price_sol > 0:
+                _, ui_bal = await get_token_balance_full(wallet, p.token_address)
+                pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
+            else:
+                entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
+                pnl = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
 
             total_pnl += pnl
 
@@ -2571,7 +2644,7 @@ async def sync_positions() -> dict:
         if raw_balance == 0:
             metrics = await get_token_metrics(pos.token_address)
             current_price = metrics.price if metrics else 0
-            pnl = ((current_price - pos.entry_price) / pos.entry_price) * 100 if current_price > 0 else -100
+            pnl = -100.0  # Tokens gone = total loss
 
             print(f"  ${pos.symbol}: OPEN but 0 balance -> marking CLOSED (PnL: {pnl:+.1f}%)")
 
@@ -2813,13 +2886,20 @@ async def force_close_position(symbol: str, reason: str = "MANUAL"):
     """Force close a position by symbol (for stuck trades)."""
     positions = load_positions()
 
+    wallet = get_wallet_pubkey()
     for i, pos in enumerate(positions):
         if pos.symbol.lower() == symbol.lower() and pos.status == "OPEN":
             metrics = await get_token_metrics(pos.token_address)
             current_price = metrics.price if metrics else 0
 
-            if current_price > 0:
-                pnl = ((current_price - pos.entry_price) / pos.entry_price) * 100
+            # SOL-based PnL
+            total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+            if metrics and metrics.price_sol > 0:
+                _, ui_bal = await get_token_balance_full(wallet, pos.token_address)
+                pnl = compute_pnl_sol(total_invested, ui_bal, metrics.price_sol) if ui_bal > 0 else -100.0
+            elif current_price > 0:
+                entry_price = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
+                pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else -100
             else:
                 pnl = -100
 
