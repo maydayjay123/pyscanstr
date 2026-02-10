@@ -1120,6 +1120,7 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
             "wrapAndUnwrapSol": True,
             "dynamicComputeUnitLimit": True,
             "prioritizationFeeLamports": "auto",
+            "dynamicSlippage": {"maxBps": 5000},  # Let Jupiter auto-calc for Token-2022 fees
         }
 
         # Try preferred endpoint first, then others
@@ -1199,8 +1200,14 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
             tx = VersionedTransaction.populate(tx.message, sigs)
 
             # Send transaction and confirm it landed
+            # Skip preflight simulation - it uses stale state and causes false 0x177e failures
+            # Failed TXs only cost base fee (~0.000005 SOL), our confirmation loop catches failures
+            from solana.rpc.types import TxOpts
             async with AsyncClient(SOLANA_RPC_URL) as client:
-                result = await client.send_raw_transaction(bytes(tx))
+                result = await client.send_raw_transaction(
+                    bytes(tx),
+                    opts=TxOpts(skip_preflight=True, preflight_commitment="processed"),
+                )
                 if result.value:
                     tx_sig = str(result.value)
                     # Wait for confirmation (up to 30s)
