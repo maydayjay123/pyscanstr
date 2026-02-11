@@ -1621,12 +1621,13 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     fully_invested = dca_step >= 3
 
     # ===== MC FLOOR: Dead coin detection (always active, any DCA step) =====
-    if metrics and metrics.mc < 15000 and held_mins >= 5:
-        return f"MC_FLOOR {pnl:.1f}% (MC ${metrics.mc:,.0f} < $15K)"
+    if metrics and metrics.mc < 8000 and held_mins >= 10:
+        return f"MC_FLOOR {pnl:.1f}% (MC ${metrics.mc:,.0f} < $8K)"
 
-    # MC never grew above entry after 20 min = no momentum, cut early
-    if metrics and held_mins >= 20 and pos.max_mc > 0:
-        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -5:
+    # MC never grew above entry after 45 min = no momentum, cut early
+    # Only if fully invested (step 3) or step 1 (didn't even dip enough for DCA)
+    if metrics and held_mins >= 45 and pos.max_mc > 0:
+        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -15:
             return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
 
     # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
@@ -1658,19 +1659,16 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         if pnl <= config["stop"]:
             return f"STOP {pnl:.1f}% (step {dca_step})"
 
-        # Step 1 only (15% invested): cut early if going nowhere
+        # Step 1 only (15% invested): cut if clearly going nowhere
         if dca_step == 1:
-            # 30+ mins at step 1 and losing > 8%: won't recover without DCA
-            if held_mins >= 30 and pnl < -8:
+            # 60+ mins at step 1 and losing > 20%: no DCA triggered = dead
+            if held_mins >= 60 and pnl < -20:
                 return f"STEP1_CUT {pnl:.1f}% ({held_mins:.0f}m, no DCA triggered)"
-            # 60+ mins at step 1 and any loss: probably dead
-            if held_mins >= 60 and pnl < -3:
-                return f"STEP1_STALE {pnl:.1f}% ({held_mins:.0f}m)"
 
-        # Step 2 (40% invested): tighter timeout
+        # Step 2 (40% invested): give DCA time to work
         if dca_step == 2:
-            # 45+ mins since entry and losing > 15%: don't throw 60% more at it
-            if held_mins >= 45 and pnl < -15:
+            # 90+ mins since entry and losing > 25%: DCA didn't save it
+            if held_mins >= 90 and pnl < -25:
                 return f"STEP2_CUT {pnl:.1f}% ({held_mins:.0f}m)"
 
         # Timeout after very long time
