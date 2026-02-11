@@ -389,6 +389,12 @@ _SIGNAL_HISTORY = {}
 #                   "pnl": float, "exit_time": str, "symbol": str}}
 _TRADE_MEMORY = {}
 
+# Post-exit watch list - continues tracking price for 2h after sell
+# {token_address: {"symbol": str, "exit_time": str, "exit_price": float,
+#                   "exit_mc": float, "exit_pnl": float, "exit_reason": str,
+#                   "post_peak_mc": float, "post_peak_price": float}}
+_POST_EXIT_WATCH = {}
+
 # Signal tracker - tracks tokens over time for dip buying
 @dataclass
 class TrackedSignal:
@@ -1031,7 +1037,7 @@ def count_trades_for_token(token_address: str) -> int:
 
 
 def record_trade_memory(pos: LivePosition):
-    """Record closed position data for smart re-entry decisions."""
+    """Record closed position data for smart re-entry decisions + post-exit tracking."""
     _TRADE_MEMORY[pos.token_address] = {
         "symbol": pos.symbol,
         "entry_price": pos.entry_price,
@@ -1041,7 +1047,18 @@ def record_trade_memory(pos: LivePosition):
         "exit_time": pos.exit_time or datetime.now().isoformat(),
         "max_pnl": pos.max_pnl_percent,
     }
-    print(f"Trade memory: ${pos.symbol} exit {pos.pnl_percent:+.1f}% peak_pnl {pos.max_pnl_percent:+.1f}%")
+    # Add to post-exit watch list - track price for 2h after sell
+    _POST_EXIT_WATCH[pos.token_address] = {
+        "symbol": pos.symbol,
+        "exit_time": pos.exit_time or datetime.now().isoformat(),
+        "exit_price": pos.exit_price,
+        "exit_mc": pos.last_mc,
+        "exit_pnl": pos.pnl_percent,
+        "exit_reason": pos.exit_reason,
+        "post_peak_mc": pos.last_mc,
+        "post_peak_price": pos.exit_price,
+    }
+    print(f"Trade memory: ${pos.symbol} exit {pos.pnl_percent:+.1f}% peak_pnl {pos.max_pnl_percent:+.1f}% (watching 2h)")
 
 
 def check_reentry_safe(token_address: str, current_price: float) -> tuple[bool, str]:
@@ -1784,6 +1801,75 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     return None
 
 
+async def track_post_exit_prices():
+    """Track price action for tokens AFTER we sold them (2h window).
+
+    This logs to price_action.csv with dca_step=-1 to mark post-exit data.
+    Lets us analyze: did the token pump after we sold? Was our exit too early?
+    """
+    import csv
+    if not _POST_EXIT_WATCH:
+        return
+
+    expired = []
+    for addr, info in _POST_EXIT_WATCH.items():
+        exit_time = datetime.fromisoformat(info["exit_time"])
+        mins_since_exit = (datetime.now() - exit_time).total_seconds() / 60
+
+        # Stop watching after 2 hours
+        if mins_since_exit > 120:
+            expired.append(addr)
+            continue
+
+        try:
+            metrics = await get_token_metrics(addr)
+            if not metrics or metrics.price <= 0:
+                continue
+
+            # Track post-exit peaks
+            if metrics.mc > info["post_peak_mc"]:
+                info["post_peak_mc"] = metrics.mc
+            if metrics.price > info["post_peak_price"]:
+                info["post_peak_price"] = metrics.price
+
+            # Calculate what PnL WOULD have been if we held
+            # (relative to exit price, not entry)
+            price_change = ((metrics.price - info["exit_price"]) / info["exit_price"]) * 100 if info["exit_price"] > 0 else 0
+
+            # Log to price_action.csv with dca_step = -1 to mark post-exit
+            file_exists = os.path.exists(PRICE_ACTION_FILE)
+            with open(PRICE_ACTION_FILE, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow([
+                        "time", "symbol", "token_address", "price", "mc",
+                        "vol_5m", "buys_5m", "sells_5m", "buy_ratio",
+                        "liquidity", "pnl_pct", "max_pnl_pct", "dca_step",
+                        "held_mins", "change_5m"
+                    ])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    info["symbol"], addr,
+                    f"{metrics.price:.10f}", f"{metrics.mc:.0f}",
+                    f"{metrics.vol_5m:.0f}", metrics.buys_5m, metrics.sells_5m,
+                    f"{metrics.buy_ratio:.2f}", f"{metrics.liquidity:.0f}",
+                    f"{price_change:.2f}", f"{info['exit_pnl']:.2f}",
+                    -1,  # dca_step = -1 means POST-EXIT tracking
+                    f"{mins_since_exit:.0f}",
+                    f"{metrics.change_5m:.2f}"
+                ])
+        except:
+            continue
+
+    # Clean up expired watches
+    for addr in expired:
+        info = _POST_EXIT_WATCH[addr]
+        peak_change = ((info["post_peak_price"] - info["exit_price"]) / info["exit_price"]) * 100 if info["exit_price"] > 0 else 0
+        if peak_change > 20:
+            print(f"POST-EXIT: ${info['symbol']} pumped {peak_change:+.0f}% after we sold ({info['exit_reason']})")
+        del _POST_EXIT_WATCH[addr]
+
+
 async def manage_positions():
     """Check and manage all open positions with enhanced metrics."""
     positions = load_positions()
@@ -1944,6 +2030,9 @@ async def manage_positions():
 
     if closed_zero > 0:
         print(f"Auto-closed {closed_zero} phantom positions (zero balance)")
+
+    # Track post-exit price action for closed tokens (2h window)
+    await track_post_exit_prices()
 
     # Update current balance for session tracking
     try:
