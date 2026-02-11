@@ -1492,6 +1492,9 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
         print(f"No token balance for {pos.symbol}, skipping sell")
         return False
 
+    # Snapshot SOL balance BEFORE sell to measure actual received
+    sol_before = await get_sol_balance(wallet)
+
     # Get quote + swap (retry with fresh quote + higher slippage if fails)
     tx_hash = None
     sol_value = 0
@@ -1540,9 +1543,17 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
 
     print(f"Confirmed: {remaining} tokens remaining (sold {raw_amount - remaining})")
 
-    # Recalculate PnL based on actual SOL received if possible
-    # For now use quote estimate
-    sol_received = sol_value
+    # Calculate ACTUAL SOL received by comparing balance before/after
+    sol_after = await get_sol_balance(wallet)
+    actual_sol_received = sol_after - sol_before
+    if actual_sol_received > 0:
+        sol_received = actual_sol_received
+        pnl = ((sol_received - total_invested) / total_invested) * 100
+        print(f"Actual PnL: {pnl:+.1f}% (received: {sol_received:.6f} / invested: {total_invested:.6f} SOL)")
+    else:
+        # Fallback to quote estimate if balance check fails
+        sol_received = sol_value
+        print(f"Using quote PnL: {pnl:+.1f}% (balance check inconclusive)")
 
     # Update position
     pos.status = "CLOSED"
