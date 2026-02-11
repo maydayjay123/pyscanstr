@@ -43,6 +43,9 @@ def get_main_menu():
             InlineKeyboardButton("💀 SELL WALLET", callback_data="sell_wallet_confirm"),
             InlineKeyboardButton("📋 Export CSV", callback_data="export_csv"),
         ],
+        [
+            InlineKeyboardButton("📉 Price Action", callback_data="export_price_action"),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -518,6 +521,36 @@ async def _handle_button(query, data):
                     async with session.post(url, data=form, timeout=15) as resp:
                         if resp.status == 200:
                             await query.edit_message_text(f"Exported {len(all_trades)} trades as CSV", reply_markup=get_back_menu())
+                        else:
+                            await query.edit_message_text("Export failed - TG API error", reply_markup=get_back_menu())
+            except Exception as e:
+                await query.edit_message_text(f"Export error: {e}", reply_markup=get_back_menu())
+
+    elif data == "export_price_action":
+        import os
+        pa_file = "price_action.csv"
+        if not os.path.exists(pa_file):
+            await query.edit_message_text("No price action data yet - bot needs to run first", reply_markup=get_back_menu())
+        else:
+            try:
+                import aiohttp as aio
+                with open(pa_file, "rb") as f:
+                    csv_bytes = f.read()
+
+                # Count rows for caption
+                line_count = csv_bytes.count(b'\n')
+                size_kb = len(csv_bytes) / 1024
+
+                form = aio.FormData()
+                form.add_field("chat_id", str(TELEGRAM_CHAT_ID))
+                form.add_field("document", csv_bytes, filename=f"price_action_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", content_type="text/csv")
+                form.add_field("caption", f"Price action: {line_count} snapshots ({size_kb:.0f}KB)")
+
+                async with aio.ClientSession() as session:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+                    async with session.post(url, data=form, timeout=30) as resp:
+                        if resp.status == 200:
+                            await query.edit_message_text(f"Exported {line_count} price snapshots", reply_markup=get_back_menu())
                         else:
                             await query.edit_message_text("Export failed - TG API error", reply_markup=get_back_menu())
             except Exception as e:

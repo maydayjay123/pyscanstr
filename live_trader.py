@@ -148,6 +148,7 @@ JUPITER_MIN_INTERVAL = 1.2 if JUPITER_API_KEY else 5  # 1.2s with API key (1 RPS
 # Position file
 POSITIONS_FILE = "live_positions.json"
 TRADES_FILE = "live_trades.csv"
+PRICE_ACTION_FILE = "price_action.csv"
 STATS_FILE = "trading_stats.json"
 LOGS_DIR = "logs"
 
@@ -580,6 +581,36 @@ def log_trade(pos: LivePosition, action: str):
                 pos.entry_vol_5m, f"{pos.entry_buy_ratio:.1f}",
                 pos.exit_tx
             ])
+
+
+def log_price_snapshot(pos: LivePosition, metrics: 'TokenMetrics', pnl: float):
+    """Log price action snapshot for analysis. One row per check cycle per token."""
+    import csv
+    file_exists = os.path.exists(PRICE_ACTION_FILE)
+    try:
+        with open(PRICE_ACTION_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "time", "symbol", "token_address", "price", "mc",
+                    "vol_5m", "buys_5m", "sells_5m", "buy_ratio",
+                    "liquidity", "pnl_pct", "max_pnl_pct", "dca_step",
+                    "held_mins", "change_5m"
+                ])
+            entry = datetime.fromisoformat(pos.entry_time)
+            held_mins = (datetime.now() - entry).total_seconds() / 60
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                pos.symbol, pos.token_address,
+                f"{metrics.price:.10f}", f"{metrics.mc:.0f}",
+                f"{metrics.vol_5m:.0f}", metrics.buys_5m, metrics.sells_5m,
+                f"{metrics.buy_ratio:.2f}", f"{metrics.liquidity:.0f}",
+                f"{pnl:.2f}", f"{pos.max_pnl_percent:.2f}",
+                pos.dca_step or 1, f"{held_mins:.0f}",
+                f"{metrics.change_5m:.2f}"
+            ])
+    except:
+        pass  # Don't let logging crash the bot
 
 
 async def get_sol_balance(pubkey: str) -> float:
@@ -1818,10 +1849,10 @@ async def manage_positions():
             pos.max_pnl_percent = pnl_now
             updated = True
             # Log when crossing profit thresholds
-            if old_max < 12 <= pnl_now:
-                log_session(f"PROFIT_LOCK ARMED: {pos.symbol} hit {pnl_now:.1f}% (will sell at 8%)")
-            if old_max < 15 <= pnl_now:
-                log_session(f"TRAIL ARMED: {pos.symbol} hit {pnl_now:.1f}% (will trail at -{6}%)")
+            if old_max < 10 <= pnl_now:
+                log_session(f"TRAIL ARMED: {pos.symbol} hit {pnl_now:.1f}% (tiered trailing active)")
+            if old_max < 50 <= pnl_now:
+                log_session(f"FLOOR SET: {pos.symbol} hit {pnl_now:.1f}% (floor at 25%)")
 
         if metrics.mc > pos.max_mc:
             pos.max_mc = metrics.mc
@@ -1830,6 +1861,9 @@ async def manage_positions():
         # Track MC changes
         pos.last_mc = metrics.mc
         pos.last_mc_time = datetime.now().isoformat()
+
+        # Log price action snapshot for analysis
+        log_price_snapshot(pos, metrics, pnl_now)
 
         if updated:
             # Persist updated tracking data
