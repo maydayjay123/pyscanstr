@@ -123,19 +123,27 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
-# Jupiter API - only used for actual swaps (not PnL checks)
-# Try multiple endpoints: lite-api (free) -> public community API as fallback
+# Jupiter API - api.jup.ag (with API key) is primary, free endpoints as fallback
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 JUPITER_QUOTE_URLS = [
-    "https://lite-api.jup.ag/swap/v1/quote",
-    "https://public.jupiterapi.com/quote",
+    "https://api.jup.ag/swap/v1/quote",          # Primary: 1 RPS with API key
+    "https://lite-api.jup.ag/swap/v1/quote",      # Fallback: free tier
+    "https://public.jupiterapi.com/quote",         # Fallback: community
 ]
 JUPITER_SWAP_URLS = [
+    "https://api.jup.ag/swap/v1/swap",
     "https://lite-api.jup.ag/swap/v1/swap",
     "https://public.jupiterapi.com/swap",
 ]
+
+def _jupiter_headers(url: str) -> dict:
+    """Return headers for Jupiter API calls (API key for api.jup.ag)."""
+    if JUPITER_API_KEY and "api.jup.ag" in url and "lite-api" not in url:
+        return {"x-api-key": JUPITER_API_KEY}
+    return {}
 # Global rate limiter - minimum seconds between Jupiter calls
 _LAST_JUPITER_CALL = 0.0
-JUPITER_MIN_INTERVAL = 5  # seconds between calls
+JUPITER_MIN_INTERVAL = 1.2 if JUPITER_API_KEY else 5  # 1.2s with API key (1 RPS), 5s without
 
 # Position file
 POSITIONS_FILE = "live_positions.json"
@@ -715,7 +723,8 @@ async def get_sol_usd_price() -> float:
         async with aiohttp.ClientSession() as session:
             for url in JUPITER_QUOTE_URLS:
                 try:
-                    async with session.get(url, params=params, timeout=10) as resp:
+                    headers = _jupiter_headers(url)
+                    async with session.get(url, params=params, headers=headers, timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             _SOL_USD_PRICE = int(data.get("outAmount", 0)) / 1_000_000
@@ -1080,8 +1089,9 @@ async def get_jupiter_quote(
         for url_idx, quote_url in enumerate(JUPITER_QUOTE_URLS):
             try:
                 await _jupiter_rate_wait()
+                headers = _jupiter_headers(quote_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(quote_url, params=params, timeout=15) as resp:
+                    async with session.get(quote_url, params=params, headers=headers, timeout=15) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             data["_endpoint_idx"] = url_idx
@@ -1134,8 +1144,9 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
             try:
                 # NO rate wait here - swap must fire immediately after quote
                 # The quote already did the rate wait
+                headers = _jupiter_headers(swap_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(swap_url, json=payload, timeout=15) as resp:
+                    async with session.post(swap_url, json=payload, headers=headers, timeout=15) as resp:
                         if resp.status == 429:
                             print(f"Swap 429 on {swap_url.split('/')[2]}, trying next...")
                             continue
