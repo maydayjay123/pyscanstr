@@ -1655,8 +1655,10 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
 
     # ===== LOSS EXITS BEFORE FULLY INVESTED =====
     if not fully_invested:
-        # Hard stop always applies even during DCA
-        if pnl <= config["stop"]:
+        # Wider hard stop during DCA - dips are expected, DCA buys them
+        # Step 3 triggers at 28% dip, so PnL can easily be -50% before recovery
+        dca_stop = -65 if dca_step >= 2 else config["stop"]
+        if pnl <= dca_stop:
             return f"STOP {pnl:.1f}% (step {dca_step})"
 
         # Step 1 only (15% invested): cut if clearly going nowhere
@@ -1831,6 +1833,23 @@ async def manage_positions():
                     break
             save_positions(positions)
 
+        # DCA BEFORE exits: if not fully invested, try to DCA first
+        # This prevents hard stops from killing positions before step 3 triggers
+        current_step = pos.dca_step if pos.dca_step and pos.dca_step > 0 else 1
+        if current_step < 3:
+            dca_success = await process_dca_step(pos, metrics.price, metrics.mc, metrics)
+            if dca_success:
+                # Reload position after DCA - re-evaluate with new average
+                positions = load_positions()
+                for p in positions:
+                    if p.token_address == pos.token_address and p.status == "OPEN":
+                        pos = p
+                        break
+                # Recalculate PnL with updated DCA average
+                total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+                if metrics.price_sol > 0 and ui_balance > 0:
+                    pnl_now = compute_pnl_sol(total_invested, ui_balance, metrics.price_sol)
+
         reason = check_exit_conditions(pos, pnl_now, metrics)
         if reason:
             log_session(f"EXIT TRIGGER: {pos.symbol} - {reason} (PnL: {pnl_now:+.1f}%, max: {pos.max_pnl_percent:+.1f}%)")
@@ -1858,8 +1877,7 @@ async def manage_positions():
                 else:
                     log_session(f"SELL FAILED: {pos.symbol} - still have {remaining} tokens, will retry")
         else:
-            # Check for DCA opportunity on ALL trades (step buying)
-            # Handle old positions that may have dca_step=0 or None
+            # Check for DCA if not already checked above (fully invested positions)
             current_step = pos.dca_step if pos.dca_step and pos.dca_step > 0 else 1
             if current_step < 3:
                 dca_success = await process_dca_step(pos, metrics.price, metrics.mc, metrics)
