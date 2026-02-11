@@ -451,8 +451,20 @@ async def _handle_button(query, data):
         if not closed and not open_pos:
             await query.edit_message_text("No trade data to export", reply_markup=get_back_menu())
         else:
-            # Build CSV
-            csv_lines = ["status,symbol,trade_type,entry_time,exit_time,held_mins,entry_mc,max_mc,sol_invested,pnl_pct,max_pnl_pct,exit_reason,dca_steps,tx_hash"]
+            # Build CSV - comprehensive analytical export
+            headers = [
+                "status", "symbol", "trade_type",
+                "entry_time", "exit_time", "held_mins",
+                "entry_mc", "max_mc", "exit_mc",
+                "entry_price", "exit_price",
+                "sol_invested", "sol_step1",
+                "pnl_pct", "max_pnl_pct",
+                "exit_reason", "dca_steps",
+                "entry_vol_5m", "entry_buys_5m", "entry_sells_5m",
+                "entry_buy_ratio", "entry_liquidity",
+                "mc_growth_pct", "token_address", "tx_hash"
+            ]
+            csv_lines = [",".join(headers)]
             all_trades = closed + open_pos
             all_trades.sort(key=lambda p: p.entry_time, reverse=True)
 
@@ -469,13 +481,25 @@ async def _handle_button(query, data):
                 sol_in = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
                 steps = p.dca_step if p.dca_step else 1
                 reason = (getattr(p, 'exit_reason', '') or "").replace(",", ";")
+                entry_vol = getattr(p, 'entry_vol_5m', 0) or 0
+                entry_buys = getattr(p, 'entry_buys_5m', 0) or 0
+                entry_sells = getattr(p, 'entry_sells_5m', 0) or 0
+                entry_ratio = getattr(p, 'entry_buy_ratio', 0) or 0
+                entry_liq = getattr(p, 'entry_liquidity', 0) or 0
+                mc_growth = ((p.max_mc - p.entry_mc) / p.entry_mc * 100) if p.entry_mc > 0 else 0
+                exit_mc = getattr(p, 'last_mc', 0) or 0
 
                 csv_lines.append(
                     f"{p.status},{p.symbol},{p.trade_type},"
                     f"{entry_dt.strftime('%Y-%m-%d %H:%M')},{exit_str},"
-                    f"{held:.0f},{p.entry_mc:.0f},{p.max_mc:.0f},"
-                    f"{sol_in:.6f},{p.pnl_percent:.2f},{p.max_pnl_percent:.2f},"
-                    f"{reason},{steps},{p.tx_hash or ''}"
+                    f"{held:.0f},{p.entry_mc:.0f},{p.max_mc:.0f},{exit_mc:.0f},"
+                    f"{p.entry_price:.10f},{p.exit_price:.10f},"
+                    f"{sol_in:.6f},{p.sol_amount:.6f},"
+                    f"{p.pnl_percent:.2f},{p.max_pnl_percent:.2f},"
+                    f"{reason},{steps},"
+                    f"{entry_vol:.0f},{entry_buys},{entry_sells},"
+                    f"{entry_ratio:.2f},{entry_liq:.0f},"
+                    f"{mc_growth:.1f},{p.token_address},{p.tx_hash or ''}"
                 )
 
             csv_content = "\n".join(csv_lines)

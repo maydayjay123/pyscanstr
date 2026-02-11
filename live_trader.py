@@ -369,10 +369,10 @@ def format_alltime_stats() -> str:
 
 # Trade type configs (same as sim)
 TRADE_CONFIGS = {
-    "QUICK": {"target": 20, "stop": -45, "timeout_hours": 2},
-    "MOMENTUM": {"target": 37, "stop": -45, "timeout_hours": 6},
-    "GEM": {"target": 112, "stop": -55, "timeout_hours": 24},
-    "RANGE": {"target": 25, "stop": -30, "timeout_hours": 48},
+    "QUICK": {"target": 50, "stop": -45, "timeout_hours": 2},
+    "MOMENTUM": {"target": 80, "stop": -45, "timeout_hours": 6},
+    "GEM": {"target": 150, "stop": -55, "timeout_hours": 24},
+    "RANGE": {"target": 40, "stop": -30, "timeout_hours": 48},
 }
 
 # DCA step buying for ALL trades
@@ -517,6 +517,11 @@ class LivePosition:
     dca_total_sol: float = 0.0      # Total SOL invested across all steps
     dca_avg_price: float = 0.0      # Average entry price across steps
     dca_buys: list = None           # List of DCA buy details [(sol, price, time), ...]
+    # Exit tracking
+    exit_reason: str = ""            # Why we sold (STOP, TRAIL, NO_PUMP, etc.)
+    # Entry context
+    entry_liquidity: float = 0.0     # Liquidity at entry
+    entry_buy_ratio: float = 0.0     # Buy ratio at entry
 
 
 def get_wallet_pubkey() -> str:
@@ -553,20 +558,27 @@ def log_trade(pos: LivePosition, action: str):
         if not file_exists:
             writer.writerow([
                 "time", "action", "symbol", "type", "price", "sol_amount",
-                "token_amount", "mc", "pnl_pct", "tx_hash"
+                "token_amount", "mc", "pnl_pct", "exit_reason", "dca_step",
+                "entry_vol_5m", "entry_buy_ratio", "tx_hash"
             ])
 
         if action == "BUY":
             writer.writerow([
                 pos.entry_time, "BUY", pos.symbol, pos.trade_type,
                 pos.entry_price, pos.sol_amount, pos.token_amount,
-                pos.entry_mc, "", pos.tx_hash
+                pos.entry_mc, "", "", pos.dca_step or 1,
+                pos.entry_vol_5m, f"{pos.entry_buy_ratio:.1f}",
+                pos.tx_hash
             ])
         else:
+            sol_in = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
             writer.writerow([
                 pos.exit_time, "SELL", pos.symbol, pos.trade_type,
-                pos.exit_price, pos.sol_amount, pos.token_amount,
-                pos.entry_mc, f"{pos.pnl_percent:.1f}%", pos.exit_tx
+                pos.exit_price, sol_in, pos.token_amount,
+                pos.entry_mc, f"{pos.pnl_percent:.1f}%",
+                pos.exit_reason, pos.dca_step or 1,
+                pos.entry_vol_5m, f"{pos.entry_buy_ratio:.1f}",
+                pos.exit_tx
             ])
 
 
@@ -1438,6 +1450,8 @@ async def buy_token(
         entry_vol_5m=entry_metrics.vol_5m if entry_metrics else 0.0,
         entry_buys_5m=entry_metrics.buys_5m if entry_metrics else 0,
         entry_sells_5m=entry_metrics.sells_5m if entry_metrics else 0,
+        entry_liquidity=entry_metrics.liquidity if entry_metrics else 0.0,
+        entry_buy_ratio=entry_metrics.buy_ratio if entry_metrics else 0.0,
         max_mc=market_cap,
         last_mc=market_cap,
         last_mc_time=datetime.now().isoformat(),
@@ -1561,6 +1575,7 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     pos.exit_time = datetime.now().isoformat()
     pos.exit_tx = tx_hash
     pos.pnl_percent = pnl
+    pos.exit_reason = reason
 
     # Save
     positions = load_positions()
@@ -1631,27 +1646,40 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
             return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
 
     # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
-    # IMPORTANT: All profit exits require pnl > 0 to prevent selling at a loss
-    # when price spikes then crashes between checks (meme volatility)
+    # Tiered trailing system: wider trail for meme coin volatility
+    # Meme coins regularly dip 10-15% during healthy pumps then recover
+    #
+    # Peak PnL     | Trail Distance | Min Floor
+    # 10-25%       | 12% from peak  | 3% (cover fees)
+    # 25-50%       | 10% from peak  | 10%
+    # 50-100%      | 15% from peak  | 25%
+    # 100%+        | 20% from peak  | 50%
 
     # Target hit - always exit on target regardless of DCA step
     if pnl >= config["target"]:
         return f"TARGET {pnl:.1f}%"
 
-    # Trailing profit - if we hit big gains and falling back
-    # Only fire if still in profit (>= 5% to cover fees)
-    if pos.max_pnl_percent >= 15 and pnl <= (pos.max_pnl_percent - 6) and pnl >= 5:
-        return f"TRAIL {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
+    # Tiered trailing stop - adapts to how high we've pumped
+    max_p = pos.max_pnl_percent
+    if max_p >= 100:
+        trail_dist, floor = 20, 50
+    elif max_p >= 50:
+        trail_dist, floor = 15, 25
+    elif max_p >= 25:
+        trail_dist, floor = 10, 10
+    elif max_p >= 10:
+        trail_dist, floor = 12, 3
+    else:
+        trail_dist, floor = 0, 0  # No trailing below 10% peak
 
-    # Quick profit lock - if we hit good profit and dropping
-    # Only fire if still in profit (>= 5% to cover fees)
-    if pos.max_pnl_percent >= 12 and pnl <= 8 and pnl >= 5:
-        return f"PROFIT_LOCK {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
-
-    # Emergency save - if max was very high and crashing, save something
-    # Only fire if still above breakeven (>= 3%)
-    if pos.max_pnl_percent >= 18 and pnl <= 6 and pnl >= 3:
-        return f"EMERGENCY_SAVE {pnl:.1f}% (max {pos.max_pnl_percent:.1f}%)"
+    if trail_dist > 0:
+        trail_trigger = max_p - trail_dist
+        # Fire trailing stop if we've dropped trail_dist from peak AND still above floor
+        if pnl <= trail_trigger and pnl >= floor:
+            return f"TRAIL {pnl:.1f}% (max {max_p:.1f}%, trail {trail_dist}%, floor {floor}%)"
+        # Breakeven floor: never let a big winner become a loser
+        if max_p >= 50 and pnl <= floor:
+            return f"FLOOR {pnl:.1f}% (max {max_p:.1f}%, floor {floor}%)"
 
     # ===== LOSS EXITS BEFORE FULLY INVESTED =====
     if not fully_invested:
@@ -1776,6 +1804,7 @@ async def manage_positions():
             pos.exit_time = datetime.now().isoformat()
             pos.exit_tx = "BALANCE_ZERO"
             pos.pnl_percent = pnl
+            pos.exit_reason = "BALANCE_ZERO"
 
             for i, p in enumerate(positions):
                 if p.token_address == pos.token_address and p.entry_time == pos.entry_time:
@@ -1866,6 +1895,7 @@ async def manage_positions():
                     pos.exit_time = datetime.now().isoformat()
                     pos.exit_tx = "SELL_UNCONFIRMED"
                     pos.pnl_percent = pnl_now
+                    pos.exit_reason = reason
                     for i, p in enumerate(positions):
                         if p.token_address == pos.token_address and p.status == "OPEN":
                             positions[i] = pos
@@ -2690,6 +2720,7 @@ async def sync_positions() -> dict:
             pos.exit_time = datetime.now().isoformat()
             pos.exit_tx = "SYNC_SOLD"
             pos.pnl_percent = pnl
+            pos.exit_reason = "SYNC_SOLD"
 
             for i, p in enumerate(positions):
                 if p.token_address == pos.token_address and p.entry_time == pos.entry_time:
@@ -2847,6 +2878,7 @@ async def sell_all_wallet_tokens() -> dict:
                             pos.status = "CLOSED"
                             pos.exit_time = datetime.now().isoformat()
                             pos.exit_tx = tx_hash
+                            pos.exit_reason = "EXTERNAL_SELL"
                             if pos.sol_amount > 0:
                                 pos.pnl_percent = ((sol_out - pos.sol_amount) / pos.sol_amount) * 100
                             positions[i] = pos
@@ -2945,6 +2977,7 @@ async def force_close_position(symbol: str, reason: str = "MANUAL"):
             pos.exit_time = datetime.now().isoformat()
             pos.exit_tx = reason
             pos.pnl_percent = pnl
+            pos.exit_reason = reason
 
             positions[i] = pos
             save_positions(positions)
