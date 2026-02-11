@@ -1621,17 +1621,17 @@ def compute_pnl_sol(total_sol_invested: float, ui_token_balance: float, price_so
 
 
 def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[TokenMetrics] = None) -> Optional[str]:
-    """Check if position should be closed with enhanced logic.
+    """Check if position should be closed.
 
-    IMPORTANT: Loss-based exits only apply AFTER step 3 (fully invested).
-    Before step 3, dips are DCA opportunities, not exit signals.
+    STRICT RULE: NO exits before all 3 DCA steps complete.
+    Only exceptions: TARGET (big win) and MC_FLOOR (dead coin).
+    This lets DCA finish averaging down before any exit decisions.
     """
     config = TRADE_CONFIGS.get(pos.trade_type, TRADE_CONFIGS["QUICK"])
 
     entry = datetime.fromisoformat(pos.entry_time)
     held_mins = (datetime.now() - entry).total_seconds() / 60
 
-    # DCA step check - if not fully invested yet, only allow profit exits
     dca_step = pos.dca_step if pos.dca_step else 1
     fully_invested = dca_step >= 3
 
@@ -1639,27 +1639,37 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if metrics and metrics.mc < 8000 and held_mins >= 10:
         return f"MC_FLOOR {pnl:.1f}% (MC ${metrics.mc:,.0f} < $8K)"
 
-    # MC never grew above entry after 45 min = no momentum, cut early
-    # Only if fully invested (step 3) or step 1 (didn't even dip enough for DCA)
-    if metrics and held_mins >= 45 and pos.max_mc > 0:
-        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -15:
-            return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
+    # ===== TARGET: Big win, always take it =====
+    if pnl >= config["target"]:
+        return f"TARGET {pnl:.1f}%"
 
-    # ===== PROFIT EXITS (always allowed, but MUST still be in profit) =====
-    # Tiered trailing system: wider trail for meme coin volatility
-    # Meme coins regularly dip 10-15% during healthy pumps then recover
+    # ===== BEFORE STEP 3: NO OTHER EXITS =====
+    # Dips are DCA opportunities, not exit signals.
+    # We're only 15-40% invested - let DCA finish its job.
+    # Even if DCA buy fails, we wait and retry next cycle.
+    if not fully_invested:
+        # Only timeout after 24 hours as absolute safety net
+        if held_mins > 1440:
+            return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
+        return None
+
+    # ===== STEP 3 COMPLETE - ALL DCA DONE, NOW MANAGE EXIT =====
+    # We're fully invested. Apply profit trailing + loss management.
+
+    # Calculate minutes since step 3 completed (grace period)
+    mins_since_step3 = 0
+    if pos.dca_buys and len(pos.dca_buys) >= 3:
+        step3_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
+        mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
+
+    # ===== TIERED TRAILING STOP (only after fully invested) =====
+    # Wider trail for meme coin volatility - they dip 10-15% during pumps
     #
     # Peak PnL     | Trail Distance | Min Floor
     # 10-25%       | 12% from peak  | 3% (cover fees)
     # 25-50%       | 10% from peak  | 10%
     # 50-100%      | 15% from peak  | 25%
     # 100%+        | 20% from peak  | 50%
-
-    # Target hit - always exit on target regardless of DCA step
-    if pnl >= config["target"]:
-        return f"TARGET {pnl:.1f}%"
-
-    # Tiered trailing stop - adapts to how high we've pumped
     max_p = pos.max_pnl_percent
     if max_p >= 100:
         trail_dist, floor = 20, 50
@@ -1673,47 +1683,10 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         trail_dist, floor = 0, 0  # No trailing below 10% peak
 
     if trail_dist > 0:
-        trail_trigger = max_p - trail_dist
-        # Fire trailing stop if we've dropped trail_dist from peak AND still above floor
-        if pnl <= trail_trigger and pnl >= floor:
-            return f"TRAIL {pnl:.1f}% (max {max_p:.1f}%, trail {trail_dist}%, floor {floor}%)"
-        # Breakeven floor: never let a big winner become a loser
-        if max_p >= 50 and pnl <= floor:
-            return f"FLOOR {pnl:.1f}% (max {max_p:.1f}%, floor {floor}%)"
-
-    # ===== LOSS EXITS BEFORE FULLY INVESTED =====
-    if not fully_invested:
-        # Wider hard stop during DCA - dips are expected, DCA buys them
-        # Step 3 triggers at 28% dip, so PnL can easily be -50% before recovery
-        dca_stop = -65 if dca_step >= 2 else config["stop"]
-        if pnl <= dca_stop:
-            return f"STOP {pnl:.1f}% (step {dca_step})"
-
-        # Step 1 only (15% invested): cut if clearly going nowhere
-        if dca_step == 1:
-            # 60+ mins at step 1 and losing > 20%: no DCA triggered = dead
-            if held_mins >= 60 and pnl < -20:
-                return f"STEP1_CUT {pnl:.1f}% ({held_mins:.0f}m, no DCA triggered)"
-
-        # Step 2 (40% invested): give DCA time to work
-        if dca_step == 2:
-            # 90+ mins since entry and losing > 25%: DCA didn't save it
-            if held_mins >= 90 and pnl < -25:
-                return f"STEP2_CUT {pnl:.1f}% ({held_mins:.0f}m)"
-
-        # Timeout after very long time
-        if held_mins > 1440:  # 24 hours
-            return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
-        return None
-
-    # ===== STEP 3 COMPLETE - NOW APPLY LOSS-BASED EXITS =====
-    # But give breathing room first - memes bounce fast after dips
-
-    # Calculate minutes since step 3 completed (grace period)
-    mins_since_step3 = 0
-    if pos.dca_buys and len(pos.dca_buys) >= 3:
-        step3_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
-        mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
+        # Use max of (peak - trail) and floor so it always triggers
+        trail_trigger = max(max_p - trail_dist, floor)
+        if pnl <= trail_trigger:
+            return f"TRAIL {pnl:.1f}% (max {max_p:.1f}%, trigger {trail_trigger:.0f}%)"
 
     # For RANGE trades, use calmer exit logic
     if pos.trade_type == "RANGE":
@@ -1724,11 +1697,16 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
             return f"RANGE TIMEOUT {pnl:.1f}%"
         return None
 
-    # Hard stop loss - always active (catastrophic protection)
+    # Hard stop loss - always active after step 3 (catastrophic protection)
     if pnl <= config["stop"]:
         return f"STOP {pnl:.1f}%"
 
-    # ===== GRACE PERIOD: 15 min after step 3, no loss exits =====
+    # MC never grew above entry after 45 min = no momentum
+    if metrics and held_mins >= 45 and pos.max_mc > 0:
+        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -15:
+            return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
+
+    # ===== GRACE PERIOD: 15 min after step 3, no other loss exits =====
     # Step 3 triggers at 28% dip - the bounce often comes within minutes
     if mins_since_step3 < 15:
         return None
