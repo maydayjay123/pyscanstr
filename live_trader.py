@@ -657,6 +657,10 @@ async def get_token_balance_full(pubkey: str, mint: str) -> tuple:
                         token_amount = info.get("tokenAmount", {})
                         raw = int(token_amount.get("amount", "0"))
                         ui = float(token_amount.get("uiAmount", 0) or 0)
+                        # uiAmount can be null for very large/small amounts - derive from raw + decimals
+                        if ui <= 0 and raw > 0:
+                            decimals = int(token_amount.get("decimals", 0))
+                            ui = raw / (10 ** decimals) if decimals > 0 else float(raw)
                         return (raw, ui)
     except Exception:
         return (0, 0.0)
@@ -943,26 +947,15 @@ async def get_token_metrics(token_address: str, retries: int = 3) -> Optional[To
                             )
                             # Validate we got real data
                             if metrics.price > 0 or metrics.mc > 0:
-                                # Override price with pool data (more accurate than DexScreener)
+                                # Derive price_sol from DexScreener USD price
+                                # Don't override with pool price - DexScreener aggregates
+                                # across all pools and is more consistent for PnL
                                 try:
-                                    pool = await get_pool_price(token_address)
-                                    if pool and pool["price_usd"] > 0:
-                                        dex_price = metrics.price
-                                        metrics.price = pool["price_usd"]
-                                        metrics.price_sol = pool["price_sol"]
-                                        # Recalculate MC from pool price if we have DexScreener's FDV ratio
-                                        if dex_price > 0 and metrics.mc > 0:
-                                            metrics.mc = metrics.mc * (pool["price_usd"] / dex_price)
+                                    sol_usd = await get_sol_usd_price()
+                                    if sol_usd > 0:
+                                        metrics.price_sol = metrics.price / sol_usd
                                 except:
-                                    pass  # Fall back to DexScreener price
-                                # Ensure price_sol is set even without pool
-                                if metrics.price_sol <= 0 and metrics.price > 0:
-                                    try:
-                                        sol_usd = await get_sol_usd_price()
-                                        if sol_usd > 0:
-                                            metrics.price_sol = metrics.price / sol_usd
-                                    except:
-                                        pass
+                                    pass
                                 return metrics
         except Exception as e:
             if attempt < retries - 1:
@@ -1795,9 +1788,8 @@ async def manage_positions():
         if metrics.price_sol > 0 and ui_balance > 0:
             pnl_now = compute_pnl_sol(total_invested, ui_balance, metrics.price_sol)
         else:
-            # Fallback: price-based (only if SOL price unavailable)
-            entry_price = pos.dca_avg_price if pos.dca_avg_price and pos.dca_avg_price > 0 else pos.entry_price
-            pnl_now = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+            # Can't compute reliable PnL - use last known value
+            pnl_now = pos.pnl_percent if pos.pnl_percent != 0 else pos.max_pnl_percent
         entry = datetime.fromisoformat(pos.entry_time)
         held_mins = (datetime.now() - entry).total_seconds() / 60
 
@@ -2457,8 +2449,7 @@ async def format_live_status_detailed() -> str:
                     _, ui_bal = await get_token_balance_full(wallet, p.token_address)
                     pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
                 else:
-                    entry_price = p.dca_avg_price if p.dca_avg_price > 0 else p.entry_price
-                    pnl = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                    pnl = p.pnl_percent  # Use last known value
                 mc_str = f"{metrics.mc/1000:.0f}K" if metrics.mc < 1_000_000 else f"{metrics.mc/1_000_000:.1f}M"
                 trend = "[+]" if metrics.change_5m > 0 else "[-]" if metrics.change_5m < -5 else "[=]"
 
@@ -2538,8 +2529,7 @@ async def format_tg_position_update() -> str:
                 _, ui_bal = await get_token_balance_full(wallet, p.token_address)
                 pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
             else:
-                entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
-                pnl = ((metrics.price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                pnl = p.pnl_percent  # Use last known value
 
             total_pnl += pnl
 
