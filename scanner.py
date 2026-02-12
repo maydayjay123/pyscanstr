@@ -261,6 +261,10 @@ def evaluate_quick(data: dict) -> Optional[TokenSignal]:
     score = 0
     reasons = []
 
+    # Minimum volume activity - skip dead/ultra-low vol
+    if data["vol_5m"] < 2000:
+        return None  # Not enough volume to confirm interest
+
     # Volume direction - must be UP
     if data["buys_5m"] <= data["sells_5m"]:
         return None  # Skip if selling
@@ -347,8 +351,8 @@ def evaluate_momentum(data: dict) -> Optional[TokenSignal]:
     score = 0
     reasons = []
 
-    # Need decent volume (lowered)
-    if data["vol_1h"] < 5000:
+    # Need decent volume - raised from 5K (MOMENTUM was worst performer at 30% win rate)
+    if data["vol_1h"] < 10000:
         return None  # Skip low volume
 
     reasons.append(f"${data['vol_1h']/1000:.0f}K vol")
@@ -358,8 +362,8 @@ def evaluate_momentum(data: dict) -> Optional[TokenSignal]:
     buy_ratio_5m = data["buys_5m"] / max(1, data["sells_5m"])
     buy_ratio_1h = data["buys_1h"] / max(1, data["sells_1h"])
 
-    if buy_ratio_5m < 1.2:
-        return None  # Skip if current selling
+    if buy_ratio_5m < 1.5:
+        return None  # Skip weak buying (raised from 1.2 - too many losers)
 
     # Starting momentum - 5m stronger than 1h
     if buy_ratio_5m > buy_ratio_1h:
@@ -568,12 +572,14 @@ def evaluate_range(data: dict) -> Optional[TokenSignal]:
         score += 15
         reasons.append(f"+{data['change_5m']:.0f}% 5m")
 
-    # RANGE SIGNAL 3: Buy pressure returning
+    # RANGE SIGNAL 3: Buy pressure returning (need real buying, not just 1.2x)
     buy_ratio_5m = data["buys_5m"] / max(1, data["sells_5m"])
+    if buy_ratio_5m < 1.3:
+        return None  # No buy pressure = no entry
     if buy_ratio_5m >= 1.5:
         score += 20
         reasons.append(f"{buy_ratio_5m:.1f}x buy")
-    elif buy_ratio_5m >= 1.2:
+    elif buy_ratio_5m >= 1.3:
         score += 10
 
     # RANGE SIGNAL 4: Decent volume (not dead)

@@ -106,14 +106,14 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
 MIN_FEE_RESERVE = float(os.getenv("MIN_FEE_RESERVE", "0.005"))  # Always keep this much SOL for fees
 CONFIRMATION_COUNT = int(os.getenv("CONFIRMATION_COUNT", "4"))  # Increased from 3
 CONFIRMATION_WINDOW_SECS = int(os.getenv("CONFIRMATION_WINDOW_SECS", "90"))  # Tighter window
-MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", "1.3"))  # Lowered to match scanner
+MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", "1.5"))  # Raised from 1.3 - need real buying pressure
 MIN_SIGNAL_LIQUIDITY = float(os.getenv("MIN_SIGNAL_LIQUIDITY", "12000"))  # Lowered to match scanner
 
 # TG update interval for positions
 TG_POSITION_UPDATE_SECS = int(os.getenv("TG_POSITION_UPDATE_SECS", "120"))  # 2 mins
 
 # Signal aging - wait before buying
-SIGNAL_MIN_AGE_MINS = int(os.getenv("SIGNAL_MIN_AGE_MINS", "10"))  # Wait 10 mins after first signal
+SIGNAL_MIN_AGE_MINS = int(os.getenv("SIGNAL_MIN_AGE_MINS", "15"))  # Wait 15 mins after first signal (raised from 10)
 SIGNAL_MAX_AGE_MINS = int(os.getenv("SIGNAL_MAX_AGE_MINS", "60"))  # Forget signals after 60 mins
 DIP_FROM_PEAK_PCT = float(os.getenv("DIP_FROM_PEAK_PCT", "10"))  # Buy when dipped 10% from peak
 MIN_DIP_PCT = float(os.getenv("MIN_DIP_PCT", "5"))  # Minimum dip to consider
@@ -1691,12 +1691,22 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if pnl >= config["target"]:
         return f"TARGET {pnl:.1f}%"
 
-    # ===== BEFORE STEP 3: NO OTHER EXITS =====
+    # ===== BEFORE STEP 3: MANAGED EXITS =====
     # Dips are DCA opportunities, not exit signals.
     # We're only 15-40% invested - let DCA finish its job.
-    # Even if DCA buy fails, we wait and retry next cycle.
+    #
+    # STALE RULE: If DCA never triggers and we're AT A LOSS, exit.
+    # If in profit, let it ride — only TARGET can close.
     if not fully_invested:
-        # Only timeout after 24 hours as absolute safety net
+        # Stale positions — only exit when NOT in profit
+        if pnl <= 0:
+            # Step 1: 4h+ held but price never dipped 12% for step 2
+            if dca_step == 1 and held_mins > 240:
+                return f"STALE_S1 {pnl:.1f}% (step 1, {held_mins/60:.1f}h, no DCA triggered)"
+            # Step 2: 3h+ held but price never dipped 28% for step 3
+            if dca_step >= 2 and held_mins > 180:
+                return f"STALE_S2 {pnl:.1f}% (step 2, {held_mins/60:.1f}h, step 3 never triggered)"
+        # Absolute safety net after 24h regardless
         if held_mins > 1440:
             return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
         return None
@@ -1919,6 +1929,23 @@ async def manage_positions():
             continue
         active_count += 1
 
+        # Safety: reconstruct dca_total_sol from dca_buys if it looks wrong
+        dca_step = pos.dca_step if pos.dca_step and pos.dca_step > 0 else 1
+        if pos.dca_buys and len(pos.dca_buys) > 1:
+            reconstructed_sol = sum(b.get("sol", 0) for b in pos.dca_buys)
+            current_total = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+            if reconstructed_sol > current_total * 1.1:  # >10% discrepancy
+                print(f"  FIX: ${pos.symbol} dca_total_sol was {current_total:.6f}, should be {reconstructed_sol:.6f} (from {len(pos.dca_buys)} buys)")
+                pos.dca_total_sol = reconstructed_sol
+                pos.sol_amount = reconstructed_sol
+                # Persist the fix
+                all_positions = load_positions()
+                for i, p in enumerate(all_positions):
+                    if p.token_address == pos.token_address and p.status == "OPEN":
+                        all_positions[i] = pos
+                        break
+                save_positions(all_positions)
+
         total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
         if metrics.price_sol > 0 and ui_balance > 0:
             pnl_now = compute_pnl_sol(total_invested, ui_balance, metrics.price_sol)
@@ -2027,6 +2054,13 @@ async def manage_positions():
             dip_from_entry = ((pos.entry_price - metrics.price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0
             dca_str = f" [{dca_step}/3 dip:{dip_from_entry:.0f}%]"
             print(f"  ${pos.symbol}: {pnl_now:+.1f}% | MC:{mc_str} | {ratio_str} {trend} | vol:{vol_str} | {held_mins:.0f}m{dca_str}")
+            # Debug: flag when dip and PnL don't make sense together
+            if dip_from_entry > 20 and pnl_now > 0:
+                current_val = ui_balance * metrics.price_sol if metrics.price_sol > 0 else 0
+                print(f"    DEBUG PnL: invested={total_invested:.6f} SOL, tokens={ui_balance:.2f}, price_sol={metrics.price_sol:.12f}, value={current_val:.6f} SOL")
+                if pos.dca_buys:
+                    for j, b in enumerate(pos.dca_buys):
+                        print(f"    DEBUG buy[{j}]: {b.get('sol', 0):.6f} SOL @ {b.get('price', 0):.10f}")
 
     if closed_zero > 0:
         print(f"Auto-closed {closed_zero} phantom positions (zero balance)")
@@ -2092,10 +2126,11 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
             print(f"DCA SKIP: ${pos.symbol} MC ${current_mc:,.0f} below 15K floor - dead coin")
             return False
 
-        # MC never went above entry = no momentum at all, don't DCA deeper
+        # MC never went above entry AND collapsed below 50% = truly dead
+        # (Don't block step 3 just because MC didn't pump — DCA's job IS to average down)
         if pos.max_mc > 0 and pos.max_mc <= pos.entry_mc * 1.05:
-            if next_step == 3:  # Only block step 3 (biggest allocation 60%)
-                print(f"DCA SKIP: ${pos.symbol} MC never pumped above entry (max {pos.max_mc:,.0f} vs entry {pos.entry_mc:,.0f})")
+            if current_mc < pos.entry_mc * 0.40:
+                print(f"DCA SKIP: ${pos.symbol} MC never pumped & collapsed to {current_mc:,.0f} (entry {pos.entry_mc:,.0f})")
                 return False
 
         # Volume completely dead = nobody trading
@@ -2364,8 +2399,8 @@ async def process_signal(signal: dict) -> bool:
         entry_score += 15
         entry_reasons.append(f"{tracked.signal_count} signals")
 
-    # Need minimum entry score to buy
-    MIN_ENTRY_SCORE = 50  # Flexible threshold
+    # Need minimum entry score to buy (raised from 50 - too many weak entries)
+    MIN_ENTRY_SCORE = 65
 
     if entry_score < MIN_ENTRY_SCORE:
         print(f"⏳ ${symbol}: score {entry_score}/{MIN_ENTRY_SCORE} | {' | '.join(entry_reasons) if entry_reasons else 'waiting'}")
@@ -2378,9 +2413,9 @@ async def process_signal(signal: dict) -> bool:
         print(f"Skip ${symbol}: liq ${liquidity:,.0f} < ${MIN_SIGNAL_LIQUIDITY:,.0f}")
         return False
 
-    # Minimum buy ratio - must have clear buying pressure to enter
-    if buy_ratio < 1.3:
-        print(f"Skip ${symbol}: buy ratio {buy_ratio:.2f}x too weak (need 1.3x+)")
+    # Minimum buy ratio - must have clear buying pressure to enter (raised from 1.3)
+    if buy_ratio < MIN_BUY_RATIO:
+        print(f"Skip ${symbol}: buy ratio {buy_ratio:.2f}x too weak (need {MIN_BUY_RATIO}x+)")
         return False
 
     # 4. Check if already in position
