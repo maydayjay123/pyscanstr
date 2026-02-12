@@ -180,7 +180,7 @@ async def _handle_button(query, data):
         )
 
     elif data == "positions":
-        from live_trader import load_positions, get_token_metrics
+        from live_trader import load_positions, get_token_metrics, get_token_balance_full, compute_pnl_sol, get_wallet_pubkey
 
         positions = load_positions()
         open_pos = [p for p in positions if p.status == "OPEN"]
@@ -190,6 +190,7 @@ async def _handle_button(query, data):
             msg += "No open positions"
         else:
             msg = f"*📊 POSITIONS* ({len(open_pos)} open)\n\n"
+            wallet = get_wallet_pubkey()
 
             total_pnl = 0.0
             for p in open_pos:
@@ -198,8 +199,13 @@ async def _handle_button(query, data):
                 held_mins = (datetime.now() - entry).total_seconds() / 60
 
                 if metrics and metrics.price > 0:
-                    entry_price = p.dca_avg_price if p.dca_avg_price and p.dca_avg_price > 0 else p.entry_price
-                    pnl = ((metrics.price - entry_price) / entry_price) * 100
+                    # SOL-based PnL (same as detailed view + manage_positions)
+                    total_sol = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
+                    if metrics.price_sol > 0:
+                        _, ui_bal = await get_token_balance_full(wallet, p.token_address)
+                        pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
+                    else:
+                        pnl = p.pnl_percent if p.pnl_percent != 0 else 0.0
 
                     total_pnl += pnl
 
