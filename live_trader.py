@@ -2054,10 +2054,13 @@ async def manage_positions():
             dip_from_entry = ((pos.entry_price - metrics.price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0
             dca_str = f" [{dca_step}/3 dip:{dip_from_entry:.0f}%]"
             print(f"  ${pos.symbol}: {pnl_now:+.1f}% | MC:{mc_str} | {ratio_str} {trend} | vol:{vol_str} | {held_mins:.0f}m{dca_str}")
-            # Debug: flag when dip and PnL don't make sense together
-            if dip_from_entry > 20 and pnl_now > 0:
+            # Debug: flag when PnL doesn't match what MC change suggests
+            mc_change_pct = ((metrics.mc - pos.entry_mc) / pos.entry_mc * 100) if pos.entry_mc > 0 else 0
+            pnl_vs_mc_mismatch = abs(pnl_now - mc_change_pct) > 30  # PnL deviates >30% from MC change
+            if pnl_vs_mc_mismatch or (dip_from_entry > 20 and pnl_now > 0):
                 current_val = ui_balance * metrics.price_sol if metrics.price_sol > 0 else 0
                 print(f"    DEBUG PnL: invested={total_invested:.6f} SOL, tokens={ui_balance:.2f}, price_sol={metrics.price_sol:.12f}, value={current_val:.6f} SOL")
+                print(f"    DEBUG MC: entry={pos.entry_mc:.0f} now={metrics.mc:.0f} change={mc_change_pct:+.1f}% vs pnl={pnl_now:+.1f}%")
                 if pos.dca_buys:
                     for j, b in enumerate(pos.dca_buys):
                         print(f"    DEBUG buy[{j}]: {b.get('sol', 0):.6f} SOL @ {b.get('price', 0):.10f}")
