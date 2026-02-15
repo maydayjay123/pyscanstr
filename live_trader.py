@@ -1795,28 +1795,55 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if pnl <= config["stop"]:
         return f"STOP {pnl:.1f}%"
 
-    # MC never grew above entry after 45 min = no momentum
-    if metrics and held_mins >= 45 and pos.max_mc > 0:
-        if pos.max_mc <= pos.entry_mc * 1.05 and pnl < -15:
-            return f"NO_PUMP {pnl:.1f}% (MC never broke above entry after {held_mins:.0f}m)"
+    # ===== STEP 3: MC + VOLUME DEATH SIGNALS =====
+    # Key MC levels: under 10K = dead, under 20K + no vol = dying.
+    # These override the grace period because the token is clearly done.
+    if metrics:
+        mc = metrics.mc
+        vol = metrics.vol_5m
+
+        # MC under 10K = token is dead, bail immediately
+        if mc < 10000:
+            return f"S3_DEAD {pnl:.1f}% (MC ${mc:,.0f}, token dead)"
+
+        # After 10 min: MC under 20K + low volume = dying fast
+        if mins_since_step3 >= 10 and mc < 20000 and vol < 500:
+            return f"S3_DYING {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f})"
 
     # ===== GRACE PERIOD: 15 min after step 3, no other loss exits =====
     # Step 3 triggers at 28% dip - the bounce often comes within minutes
     if mins_since_step3 < 15:
         return None
 
+    # ===== STEP 3: POST-GRACE MC + VOLUME CHECKS =====
+    # If token hasn't bounced above 5% AND MC/volume look dead, bail early.
+    # Don't wait for the full -60% stop on a corpse.
+    if metrics and max_p < 5:
+        mc = metrics.mc
+        vol = metrics.vol_5m
+
+        # Low MC + low volume = no interest, nobody buying
+        if mc < 30000 and vol < 1000:
+            return f"S3_LOW_MC {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f}, no bounce)"
+
+        # Any MC but volume completely dead = no buyers left
+        if vol < 200:
+            return f"S3_NO_VOL {pnl:.1f}% (vol {vol:.0f}, MC ${mc/1000:.0f}K, no bounce)"
+
+        # MC dropped 50%+ from entry with no bounce = token collapsing
+        if pos.entry_mc > 0 and mc < pos.entry_mc * 0.50:
+            return f"S3_MC_DUMP {pnl:.1f}% (MC ${mc/1000:.0f}K vs entry ${pos.entry_mc/1000:.0f}K)"
+
     # ===== "DEAD TRADE" SIGNALS (15-45 min after step 3) =====
-    # Use much wider thresholds - only exit if trade is truly dead
+    # Wider thresholds for tokens that showed SOME bounce but failed
     if metrics and mins_since_step3 >= 15:
 
         # Volume completely dried up - nobody trading anymore
-        # Need vol < 10% of entry AND losing > 15%
         if pos.entry_vol_5m > 0 and metrics.vol_5m < pos.entry_vol_5m * 0.10:
             if pnl < -15:
                 return f"DEAD_VOL {pnl:.1f}% (vol {metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})"
 
         # Heavy sustained dump - sellers overwhelm buyers AND deep loss
-        # Need sells > 3x buys AND losing > 20%
         if metrics.sells_5m > metrics.buys_5m * 3 and pnl < -20:
             return f"DUMP {pnl:.1f}% (sells {metrics.sells_5m} > 3x buys {metrics.buys_5m})"
 
@@ -1827,7 +1854,6 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
                 return f"MC_DEAD {pnl:.1f}% (mc {current_mc/1000:.0f}K vs peak {pos.max_mc/1000:.0f}K)"
 
     # ===== EXTENDED LOSS EXITS (45+ min after step 3) =====
-    # More standard thresholds but still wider than before
     if metrics and mins_since_step3 >= 45:
 
         # Volume decayed - vol < 20% entry AND losing > 10%
