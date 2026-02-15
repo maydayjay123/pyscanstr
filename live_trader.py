@@ -1752,11 +1752,12 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
 
     # ===== TIERED TRAILING STOP (only after fully invested) =====
-    # Meme coins dip 10-20% during pumps. Old 3% floor was killing trades
-    # like CANADA (peaked 10.9%, floor 3%, sold at -6.4%).
-    # Don't trail until 20%+ peak - anything below is just noise.
+    # Meme coins dip 10-20% during pumps. Old 3% floor was killing trades.
+    # 10-20% peak: catch bounces after DCA at break-even minimum.
+    # 20%+: wider trails to ride bigger pumps.
     #
     # Peak PnL     | Trail Distance | Min Floor
+    # 10-20%       | 8% from peak   | 0% (break-even protection)
     # 20-40%       | 15% from peak  | 5%
     # 40-70%       | 15% from peak  | 15%
     # 70-120%      | 20% from peak  | 30%
@@ -1770,8 +1771,10 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         trail_dist, floor = 15, 15
     elif max_p >= 20:
         trail_dist, floor = 15, 5
+    elif max_p >= 10:
+        trail_dist, floor = 8, 0  # Catch 10-15% bounces at break-even minimum
     else:
-        trail_dist, floor = 0, 0  # No trailing below 20% peak - let it run
+        trail_dist, floor = 0, 0  # No trailing below 10% peak - let it run
 
     if trail_dist > 0:
         # Use max of (peak - trail) and floor so it always triggers
