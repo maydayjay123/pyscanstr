@@ -370,10 +370,10 @@ def format_alltime_stats() -> str:
 
 # Trade type configs (same as sim)
 TRADE_CONFIGS = {
-    "QUICK": {"target": 50, "stop": -45, "timeout_hours": 2},
-    "MOMENTUM": {"target": 80, "stop": -45, "timeout_hours": 6},
-    "GEM": {"target": 150, "stop": -55, "timeout_hours": 24},
-    "RANGE": {"target": 40, "stop": -30, "timeout_hours": 48},
+    "QUICK": {"target": 50, "stop": -60, "timeout_hours": 2},     # was -45, too tight after step 3
+    "MOMENTUM": {"target": 80, "stop": -60, "timeout_hours": 6},  # was -45, step 3 enters at -28% dip
+    "GEM": {"target": 150, "stop": -65, "timeout_hours": 24},     # was -55
+    "RANGE": {"target": 40, "stop": -40, "timeout_hours": 48},    # was -30
 }
 
 # DCA step buying for ALL trades
@@ -1752,24 +1752,26 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
         mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
 
     # ===== TIERED TRAILING STOP (only after fully invested) =====
-    # Wider trail for meme coin volatility - they dip 10-15% during pumps
+    # Meme coins dip 10-20% during pumps. Old 3% floor was killing trades
+    # like CANADA (peaked 10.9%, floor 3%, sold at -6.4%).
+    # Don't trail until 20%+ peak - anything below is just noise.
     #
     # Peak PnL     | Trail Distance | Min Floor
-    # 10-25%       | 12% from peak  | 3% (cover fees)
-    # 25-50%       | 10% from peak  | 10%
-    # 50-100%      | 15% from peak  | 25%
-    # 100%+        | 20% from peak  | 50%
+    # 20-40%       | 15% from peak  | 5%
+    # 40-70%       | 15% from peak  | 15%
+    # 70-120%      | 20% from peak  | 30%
+    # 120%+        | 25% from peak  | 60%
     max_p = pos.max_pnl_percent
-    if max_p >= 100:
-        trail_dist, floor = 20, 50
-    elif max_p >= 50:
-        trail_dist, floor = 15, 25
-    elif max_p >= 25:
-        trail_dist, floor = 10, 10
-    elif max_p >= 10:
-        trail_dist, floor = 12, 3
+    if max_p >= 120:
+        trail_dist, floor = 25, 60
+    elif max_p >= 70:
+        trail_dist, floor = 20, 30
+    elif max_p >= 40:
+        trail_dist, floor = 15, 15
+    elif max_p >= 20:
+        trail_dist, floor = 15, 5
     else:
-        trail_dist, floor = 0, 0  # No trailing below 10% peak
+        trail_dist, floor = 0, 0  # No trailing below 20% peak - let it run
 
     if trail_dist > 0:
         # Use max of (peak - trail) and floor so it always triggers
