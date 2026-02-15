@@ -1557,13 +1557,14 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     # Snapshot SOL balance BEFORE sell to measure actual received
     sol_before = await get_sol_balance(wallet)
 
-    # Get quote + swap (retry with fresh quote + higher slippage if fails)
+    # Get quote + swap - SELLS use higher slippage (speed > price on exits)
     tx_hash = None
     sol_value = 0
     pnl = 0
     total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
+    sell_slippage = int(MAX_SLIPPAGE_BPS * 1.3)  # 20% first try (sells need to fill fast)
     for swap_attempt in range(2):
-        slippage = MAX_SLIPPAGE_BPS if swap_attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.7)  # 25% on retry
+        slippage = sell_slippage if swap_attempt == 0 else int(sell_slippage * 1.5)  # 30% on retry
         quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount), slippage)
         if not quote:
             print("Failed to get sell quote")
@@ -1671,9 +1672,9 @@ def compute_pnl_sol(total_sol_invested: float, ui_token_balance: float, price_so
 def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[TokenMetrics] = None) -> Optional[str]:
     """Check if position should be closed.
 
-    STRICT RULE: NO exits before all 3 DCA steps complete.
-    Only exceptions: TARGET (big win) and MC_FLOOR (dead coin).
-    This lets DCA finish averaging down before any exit decisions.
+    DCA is still active for dips, but we NOW take profits at ANY step.
+    Data showed 11 of 13 STALE exits had 10-52% peaks - bot held through
+    the entire pump with no way to sell. EARLY_TP fixes this.
     """
     config = TRADE_CONFIGS.get(pos.trade_type, TRADE_CONFIGS["QUICK"])
 
@@ -1691,14 +1692,43 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if pnl >= config["target"]:
         return f"TARGET {pnl:.1f}%"
 
-    # ===== BEFORE STEP 3: MANAGED EXITS =====
-    # Dips are DCA opportunities, not exit signals.
-    # We're only 15-40% invested - let DCA finish its job.
-    #
-    # STALE RULE: If DCA never triggers and we're AT A LOSS, exit.
-    # If in profit, let it ride — only TARGET can close.
+    # ===== BEFORE STEP 3: EARLY PROFIT + MANAGED EXITS =====
+    # DCA is still active for dips, but we NOW take profits early.
+    # Data shows: most tokens DO pump, but bot held through pump and sold at loss.
+    # 11 of 13 STALE_S1 exits had max_pnl > 10% - tokens pumped but bot missed it.
     if not fully_invested:
-        # Stale positions — only exit when NOT in profit
+
+        # ===== EARLY PROFIT TRAILING (THE KEY FIX) =====
+        # If we're up significantly at step 1-2, take the profit!
+        # Don't wait for step 3 that may never come.
+        max_p = pos.max_pnl_percent
+
+        # Step 1: we're only 15% invested, so be aggressive with profit taking
+        # Step 2: we're 40% invested, slightly wider trail
+        if dca_step == 1:
+            # At step 1, activate trail once we've seen 20%+ peak
+            if max_p >= 40:
+                # Big pump: trail 15% from peak, floor at 20%
+                trail_trigger = max(max_p - 15, 20)
+                if pnl <= trail_trigger:
+                    return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+            elif max_p >= 20:
+                # Moderate pump: trail 12% from peak, floor at 8%
+                trail_trigger = max(max_p - 12, 8)
+                if pnl <= trail_trigger:
+                    return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+        elif dca_step >= 2:
+            # Step 2: 40% invested, slightly wider trail
+            if max_p >= 30:
+                trail_trigger = max(max_p - 12, 15)
+                if pnl <= trail_trigger:
+                    return f"EARLY_TP {pnl:.1f}% (step 2, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+            elif max_p >= 15:
+                trail_trigger = max(max_p - 10, 5)
+                if pnl <= trail_trigger:
+                    return f"EARLY_TP {pnl:.1f}% (step 2, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+
+        # ===== STALE EXITS (no pump, at a loss) =====
         if pnl <= 0:
             # Step 1: 4h+ held but price never dipped 12% for step 2
             if dca_step == 1 and held_mins > 240:
@@ -1706,6 +1736,7 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
             # Step 2: 3h+ held but price never dipped 28% for step 3
             if dca_step >= 2 and held_mins > 180:
                 return f"STALE_S2 {pnl:.1f}% (step 2, {held_mins/60:.1f}h, step 3 never triggered)"
+
         # Absolute safety net after 24h regardless
         if held_mins > 1440:
             return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
