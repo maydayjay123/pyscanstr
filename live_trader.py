@@ -1706,9 +1706,9 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
             if pnl <= trail_trigger:
                 return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
 
-        # Hard stop at step 1
-        if pnl <= config["stop"]:
-            return f"STOP {pnl:.1f}% (step 1)"
+        # NO hard stop at step 1 — we're only 35% invested.
+        # Let DCA trigger at -10% to average down. MC floor + stale timeout
+        # are the safety nets. Stop loss only activates after fully invested.
 
         # Stale step 1: 60 min with no pump, at a loss
         if pnl <= 0 and held_mins > 60:
