@@ -1562,9 +1562,9 @@ async def sell_token(pos: LivePosition, reason: str) -> bool:
     sol_value = 0
     pnl = 0
     total_invested = pos.dca_total_sol if pos.dca_total_sol and pos.dca_total_sol > 0 else pos.sol_amount
-    sell_slippage = int(MAX_SLIPPAGE_BPS * 1.3)  # 20% first try (sells need to fill fast)
+    sell_slippage = MAX_SLIPPAGE_BPS  # 15% first try (same as buys — don't give away profit)
     for swap_attempt in range(2):
-        slippage = sell_slippage if swap_attempt == 0 else int(sell_slippage * 1.5)  # 30% on retry
+        slippage = sell_slippage if swap_attempt == 0 else int(sell_slippage * 1.3)  # 20% on retry
         quote = await get_jupiter_quote(pos.token_address, SOL_MINT, int(raw_amount), slippage)
         if not quote:
             print("Failed to get sell quote")
