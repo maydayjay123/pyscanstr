@@ -370,15 +370,15 @@ def format_alltime_stats() -> str:
 
 # Trade type configs (same as sim)
 TRADE_CONFIGS = {
-    "QUICK": {"target": 50, "stop": -60, "timeout_hours": 2},     # was -45, too tight after step 3
-    "MOMENTUM": {"target": 80, "stop": -60, "timeout_hours": 6},  # was -45, step 3 enters at -28% dip
-    "GEM": {"target": 150, "stop": -65, "timeout_hours": 24},     # was -55
-    "RANGE": {"target": 40, "stop": -40, "timeout_hours": 48},    # was -30
+    "QUICK": {"target": 50, "stop": -25, "timeout_hours": 2},     # tighter stop, no step 3 to protect
+    "MOMENTUM": {"target": 80, "stop": -25, "timeout_hours": 6},  # tighter stop, 2-step DCA only
+    "GEM": {"target": 150, "stop": -30, "timeout_hours": 24},     # GEM gets slightly more room
+    "RANGE": {"target": 40, "stop": -25, "timeout_hours": 48},    # tighter stop, 2-step DCA
 }
 
-# DCA step buying for ALL trades
-DCA_STEPS = [0.15, 0.25, 0.60]  # 15% / 25% / 60% position allocation
-DCA_STEP_TRIGGERS = [0, 12, 28]  # Entry, 12% dip, 28% dip from avg
+# DCA step buying for ALL trades (2-step system: no step 3)
+DCA_STEPS = [0.35, 0.65]  # 35% entry / 65% on dip
+DCA_STEP_TRIGGERS = [0, 10]  # Entry, 10% dip from avg
 
 # Cached keypair
 _KEYPAIR_CACHE = None
@@ -520,7 +520,7 @@ class LivePosition:
     last_mc_time: str = ""          # When MC was last checked
     max_mc: float = 0.0             # Highest MC seen
     # DCA tracking for RANGE trades
-    dca_step: int = 0               # 0=none, 1=step1 (15%), 2=step2 (25%), 3=step3 (60%)
+    dca_step: int = 0               # 0=none, 1=step1 (35%), 2=step2 (65%) — 2-step system
     dca_total_sol: float = 0.0      # Total SOL invested across all steps
     dca_avg_price: float = 0.0      # Average entry price across steps
     dca_buys: list = None           # List of DCA buy details [(sol, price, time), ...]
@@ -1670,11 +1670,11 @@ def compute_pnl_sol(total_sol_invested: float, ui_token_balance: float, price_so
 
 
 def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[TokenMetrics] = None) -> Optional[str]:
-    """Check if position should be closed.
+    """Check if position should be closed — 2-step DCA system.
 
-    DCA is still active for dips, but we NOW take profits at ANY step.
-    Data showed 11 of 13 STALE exits had 10-52% peaks - bot held through
-    the entire pump with no way to sell. EARLY_TP fixes this.
+    Step 1: 35% invested at entry. Take profits aggressively (small position).
+    Step 2: 100% invested (after -10% DCA). Tighter trails, faster exits.
+    No step 3 — data showed 0% win rate on deep DCA.
     """
     config = TRADE_CONFIGS.get(pos.trade_type, TRADE_CONFIGS["QUICK"])
 
@@ -1682,7 +1682,7 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     held_mins = (datetime.now() - entry).total_seconds() / 60
 
     dca_step = pos.dca_step if pos.dca_step else 1
-    fully_invested = dca_step >= 3
+    fully_invested = dca_step >= 2
 
     # ===== MC FLOOR: Dead coin detection (always active, any DCA step) =====
     if metrics and metrics.mc < 8000 and held_mins >= 10:
@@ -1692,92 +1692,59 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     if pnl >= config["target"]:
         return f"TARGET {pnl:.1f}%"
 
-    # ===== BEFORE STEP 3: EARLY PROFIT + MANAGED EXITS =====
-    # DCA is still active for dips, but we NOW take profits early.
-    # Data shows: most tokens DO pump, but bot held through pump and sold at loss.
-    # 11 of 13 STALE_S1 exits had max_pnl > 10% - tokens pumped but bot missed it.
+    # ===== STEP 1: 35% INVESTED — EARLY PROFIT + MANAGED EXITS =====
     if not fully_invested:
-
-        # ===== EARLY PROFIT TRAILING (THE KEY FIX) =====
-        # If we're up significantly at step 1-2, take the profit!
-        # Don't wait for step 3 that may never come.
         max_p = pos.max_pnl_percent
 
-        # Step 1: we're only 15% invested, so be aggressive with profit taking
-        # Step 2: we're 40% invested, slightly wider trail
-        if dca_step == 1:
-            # At step 1, activate trail once we've seen 20%+ peak
-            if max_p >= 40:
-                # Big pump: trail 15% from peak, floor at 20%
-                trail_trigger = max(max_p - 15, 20)
-                if pnl <= trail_trigger:
-                    return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
-            elif max_p >= 20:
-                # Moderate pump: trail 12% from peak, floor at 8%
-                trail_trigger = max(max_p - 12, 8)
-                if pnl <= trail_trigger:
-                    return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
-        elif dca_step >= 2:
-            # Step 2: 40% invested, slightly wider trail
-            if max_p >= 30:
-                trail_trigger = max(max_p - 12, 15)
-                if pnl <= trail_trigger:
-                    return f"EARLY_TP {pnl:.1f}% (step 2, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
-            elif max_p >= 15:
-                trail_trigger = max(max_p - 10, 5)
-                if pnl <= trail_trigger:
-                    return f"EARLY_TP {pnl:.1f}% (step 2, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+        # Trail from 15%+ peak: 8% trail, 5% floor
+        if max_p >= 40:
+            trail_trigger = max(max_p - 15, 20)
+            if pnl <= trail_trigger:
+                return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
+        elif max_p >= 15:
+            trail_trigger = max(max_p - 8, 5)
+            if pnl <= trail_trigger:
+                return f"EARLY_TP {pnl:.1f}% (step 1, peak {max_p:.1f}%, trail from {trail_trigger:.0f}%)"
 
-        # ===== STALE EXITS (no pump, at a loss) =====
-        if pnl <= 0:
-            # Step 1: 4h+ held but price never dipped 12% for step 2
-            if dca_step == 1 and held_mins > 240:
-                return f"STALE_S1 {pnl:.1f}% (step 1, {held_mins/60:.1f}h, no DCA triggered)"
-            # Step 2: 3h+ held but price never dipped 28% for step 3
-            if dca_step >= 2 and held_mins > 180:
-                return f"STALE_S2 {pnl:.1f}% (step 2, {held_mins/60:.1f}h, step 3 never triggered)"
+        # Hard stop at step 1
+        if pnl <= config["stop"]:
+            return f"STOP {pnl:.1f}% (step 1)"
 
-        # Absolute safety net after 24h regardless
+        # Stale step 1: 60 min with no pump, at a loss
+        if pnl <= 0 and held_mins > 60:
+            return f"STALE_S1 {pnl:.1f}% (step 1, {held_mins:.0f}min, no DCA triggered)"
+
+        # Safety net
         if held_mins > 1440:
-            return f"DCA_TIMEOUT {pnl:.1f}% (step {dca_step}/3, {held_mins/60:.0f}h)"
+            return f"DCA_TIMEOUT {pnl:.1f}% (step 1, {held_mins/60:.0f}h)"
         return None
 
-    # ===== STEP 3 COMPLETE - ALL DCA DONE, NOW MANAGE EXIT =====
-    # We're fully invested. Apply profit trailing + loss management.
+    # ===== STEP 2: FULLY INVESTED (100%) — TIGHT EXIT MANAGEMENT =====
 
-    # Calculate minutes since step 3 completed (grace period)
-    mins_since_step3 = 0
-    if pos.dca_buys and len(pos.dca_buys) >= 3:
-        step3_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
-        mins_since_step3 = (datetime.now() - step3_time).total_seconds() / 60
+    # Calculate minutes since step 2 completed (grace period for bounce)
+    mins_since_dca = 0
+    if pos.dca_buys and len(pos.dca_buys) >= 2:
+        dca_time = datetime.fromisoformat(pos.dca_buys[-1]["time"])
+        mins_since_dca = (datetime.now() - dca_time).total_seconds() / 60
 
-    # ===== TIERED TRAILING STOP (only after fully invested) =====
-    # Meme coins dip 10-20% during pumps. Old 3% floor was killing trades.
-    # 10-20% peak: catch bounces after DCA at break-even minimum.
-    # 20%+: wider trails to ride bigger pumps.
+    # ===== TIERED TRAILING STOP =====
+    # Tighter than before — secure profits faster.
     #
     # Peak PnL     | Trail Distance | Min Floor
-    # 10-20%       | 8% from peak   | 0% (break-even protection)
-    # 20-40%       | 15% from peak  | 5%
-    # 40-70%       | 15% from peak  | 15%
-    # 70-120%      | 20% from peak  | 30%
-    # 120%+        | 25% from peak  | 60%
+    # 10-20%       | 6% from peak   | 0% (break-even)
+    # 20-40%       | 10% from peak  | 5%
+    # 40%+         | 12% from peak  | 15%
     max_p = pos.max_pnl_percent
-    if max_p >= 120:
-        trail_dist, floor = 25, 60
-    elif max_p >= 70:
-        trail_dist, floor = 20, 30
-    elif max_p >= 40:
-        trail_dist, floor = 15, 15
+    if max_p >= 40:
+        trail_dist, floor = 12, 15
     elif max_p >= 20:
-        trail_dist, floor = 15, 5
+        trail_dist, floor = 10, 5
     elif max_p >= 10:
-        trail_dist, floor = 8, 0  # Catch 10-15% bounces at break-even minimum
+        trail_dist, floor = 6, 0
     else:
-        trail_dist, floor = 0, 0  # No trailing below 10% peak - let it run
+        trail_dist, floor = 0, 0  # No trailing below 10% peak
 
     if trail_dist > 0:
-        # Use max of (peak - trail) and floor so it always triggers
         trail_trigger = max(max_p - trail_dist, floor)
         if pnl <= trail_trigger:
             return f"TRAIL {pnl:.1f}% (max {max_p:.1f}%, trigger {trail_trigger:.0f}%)"
@@ -1785,85 +1752,84 @@ def check_exit_conditions(pos: LivePosition, pnl: float, metrics: Optional[Token
     # For RANGE trades, use calmer exit logic
     if pos.trade_type == "RANGE":
         if pnl <= config["stop"]:
-            return f"RANGE STOP {pnl:.1f}%"
+            return f"RANGE_STOP {pnl:.1f}%"
         timeout = timedelta(hours=config["timeout_hours"])
         if datetime.now() - entry > timeout:
-            return f"RANGE TIMEOUT {pnl:.1f}%"
+            return f"RANGE_TIMEOUT {pnl:.1f}%"
         return None
 
-    # Hard stop loss - always active after step 3 (catastrophic protection)
+    # Hard stop loss — always active (tighter now: -25%)
     if pnl <= config["stop"]:
         return f"STOP {pnl:.1f}%"
 
-    # ===== STEP 3: MC + VOLUME DEATH SIGNALS =====
-    # Key MC levels: under 10K = dead, under 20K + no vol = dying.
-    # These override the grace period because the token is clearly done.
+    # ===== MC + VOLUME DEATH SIGNALS =====
+    # Adapted from step 3 logic — catches dead tokens early.
     if metrics:
         mc = metrics.mc
         vol = metrics.vol_5m
 
         # MC under 10K = token is dead, bail immediately
         if mc < 10000:
-            return f"S3_DEAD {pnl:.1f}% (MC ${mc:,.0f}, token dead)"
+            return f"DEAD {pnl:.1f}% (MC ${mc:,.0f}, token dead)"
 
         # After 10 min: MC under 20K + low volume = dying fast
-        if mins_since_step3 >= 10 and mc < 20000 and vol < 500:
-            return f"S3_DYING {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f})"
+        if mins_since_dca >= 10 and mc < 20000 and vol < 500:
+            return f"DYING {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f})"
 
-    # ===== GRACE PERIOD: 15 min after step 3, no other loss exits =====
-    # Step 3 triggers at 28% dip - the bounce often comes within minutes
-    if mins_since_step3 < 15:
+    # ===== GRACE PERIOD: 10 min after DCA, let it bounce =====
+    # Step 2 triggers at 10% dip — bounce window is shorter than old 28% dip
+    if mins_since_dca < 10:
         return None
 
-    # ===== STEP 3: POST-GRACE MC + VOLUME CHECKS =====
-    # If token hasn't bounced above 5% AND MC/volume look dead, bail early.
-    # Don't wait for the full -60% stop on a corpse.
+    # ===== POST-GRACE MC + VOLUME CHECKS =====
     if metrics and max_p < 5:
         mc = metrics.mc
         vol = metrics.vol_5m
 
-        # Low MC + low volume = no interest, nobody buying
+        # Low MC + low volume = no interest
         if mc < 30000 and vol < 1000:
-            return f"S3_LOW_MC {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f}, no bounce)"
+            return f"LOW_MC {pnl:.1f}% (MC ${mc/1000:.0f}K, vol {vol:.0f}, no bounce)"
 
-        # Any MC but volume completely dead = no buyers left
+        # Volume completely dead
         if vol < 200:
-            return f"S3_NO_VOL {pnl:.1f}% (vol {vol:.0f}, MC ${mc/1000:.0f}K, no bounce)"
+            return f"NO_VOL {pnl:.1f}% (vol {vol:.0f}, MC ${mc/1000:.0f}K, no bounce)"
 
-        # MC dropped 50%+ from entry with no bounce = token collapsing
+        # MC dropped 50%+ from entry
         if pos.entry_mc > 0 and mc < pos.entry_mc * 0.50:
-            return f"S3_MC_DUMP {pnl:.1f}% (MC ${mc/1000:.0f}K vs entry ${pos.entry_mc/1000:.0f}K)"
+            return f"MC_DUMP {pnl:.1f}% (MC ${mc/1000:.0f}K vs entry ${pos.entry_mc/1000:.0f}K)"
 
-    # ===== "DEAD TRADE" SIGNALS (15-45 min after step 3) =====
-    # Wider thresholds for tokens that showed SOME bounce but failed
-    if metrics and mins_since_step3 >= 15:
+    # ===== DEAD TRADE SIGNALS (10+ min after DCA) =====
+    if metrics and mins_since_dca >= 10:
 
-        # Volume completely dried up - nobody trading anymore
+        # Volume dried up
         if pos.entry_vol_5m > 0 and metrics.vol_5m < pos.entry_vol_5m * 0.10:
             if pnl < -15:
                 return f"DEAD_VOL {pnl:.1f}% (vol {metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})"
 
-        # Heavy sustained dump - sellers overwhelm buyers AND deep loss
+        # Heavy dump — sellers 3x buyers
         if metrics.sells_5m > metrics.buys_5m * 3 and pnl < -20:
             return f"DUMP {pnl:.1f}% (sells {metrics.sells_5m} > 3x buys {metrics.buys_5m})"
 
-        # MC collapsed - dropped 50%+ from peak with no recovery after 30 min
-        current_mc = metrics.mc
-        if pos.max_mc > 0 and current_mc < pos.max_mc * 0.50:
-            if mins_since_step3 > 30 and pnl < -25:
-                return f"MC_DEAD {pnl:.1f}% (mc {current_mc/1000:.0f}K vs peak {pos.max_mc/1000:.0f}K)"
+        # MC collapsed 50%+ from peak after 20 min
+        if pos.max_mc > 0 and metrics.mc < pos.max_mc * 0.50:
+            if mins_since_dca > 20 and pnl < -20:
+                return f"MC_DEAD {pnl:.1f}% (mc {metrics.mc/1000:.0f}K vs peak {pos.max_mc/1000:.0f}K)"
 
-    # ===== EXTENDED LOSS EXITS (45+ min after step 3) =====
-    if metrics and mins_since_step3 >= 45:
+    # ===== EXTENDED LOSS EXITS (30+ min after DCA) =====
+    if metrics and mins_since_dca >= 30:
 
-        # Volume decayed - vol < 20% entry AND losing > 10%
+        # Volume decayed below 20% of entry
         if pos.entry_vol_5m > 0 and metrics.vol_5m < pos.entry_vol_5m * VOL_DECAY_THRESHOLD:
             if pnl < -10:
                 return f"VOL_DECAY {pnl:.1f}% (vol {metrics.vol_5m:.0f} vs entry {pos.entry_vol_5m:.0f})"
 
-        # No buyers left - ratio < 0.5 AND significant loss
+        # No buyers left
         if metrics.buy_ratio < 0.5 and pnl < -15:
             return f"NO_BUYERS {pnl:.1f}% (ratio {metrics.buy_ratio:.1f}x)"
+
+    # Stale step 2: 90 min fully invested with no profit
+    if pnl <= 0 and mins_since_dca > 90:
+        return f"STALE_S2 {pnl:.1f}% (fully invested, {mins_since_dca:.0f}min, no bounce)"
 
     # Timeout
     timeout = timedelta(hours=config["timeout_hours"])
@@ -2050,9 +2016,9 @@ async def manage_positions():
             save_positions(positions)
 
         # DCA BEFORE exits: if not fully invested, try to DCA first
-        # This prevents hard stops from killing positions before step 3 triggers
+        # This prevents hard stops from killing positions before step 2 triggers
         current_step = pos.dca_step if pos.dca_step and pos.dca_step > 0 else 1
-        if current_step < 3:
+        if current_step < 2:
             dca_success = await process_dca_step(pos, metrics.price, metrics.mc, metrics)
             if dca_success:
                 # Reload position after DCA - re-evaluate with new average
@@ -2146,14 +2112,13 @@ async def manage_positions():
 async def process_dca_step(pos: LivePosition, current_price: float, current_mc: float, entry_metrics: Optional[TokenMetrics] = None) -> bool:
     """Process DCA step for ANY position - buy next step on dip.
 
-    DCA triggers are based on dip from ORIGINAL entry price:
-    - Step 2: 12% dip from entry
-    - Step 3: 28% dip from entry
+    2-step DCA: triggers based on dip from ORIGINAL entry price:
+    - Step 2: 10% dip from entry (65% of position)
     """
     # Handle old positions without DCA tracking
     dca_step = pos.dca_step if pos.dca_step and pos.dca_step > 0 else 1
 
-    if dca_step >= 3:
+    if dca_step >= 2:
         return False  # Already fully invested
 
     # Minimum 5 minutes between DCA steps to avoid instant double-buys
@@ -2170,7 +2135,7 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         return False  # Too soon after entry
 
     # IMPORTANT: Calculate dip from ORIGINAL entry price, not average
-    # This ensures step 2 triggers at 12% below entry, step 3 at 28% below entry
+    # This ensures step 2 triggers at 10% below entry
     original_entry = pos.entry_price
     if original_entry <= 0:
         return False
@@ -2192,7 +2157,6 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
             return False
 
         # MC never went above entry AND collapsed below 50% = truly dead
-        # (Don't block step 3 just because MC didn't pump — DCA's job IS to average down)
         if pos.max_mc > 0 and pos.max_mc <= pos.entry_mc * 1.05:
             if current_mc < pos.entry_mc * 0.40:
                 print(f"DCA SKIP: ${pos.symbol} MC never pumped & collapsed to {current_mc:,.0f} (entry {pos.entry_mc:,.0f})")
@@ -2313,7 +2277,7 @@ async def process_dca_step(pos: LivePosition, current_price: float, current_mc: 
         if dca_step == 1:
             step1_tps = pos.token_amount / step1_sol if step1_sol > 0 else 0
         else:
-            # For step 3, use previous step's data
+            # For step 2, use previous step's data
             step1_tps = pos.token_amount / pos.dca_total_sol if pos.dca_total_sol > 0 else 0
             step1_price = pos.dca_avg_price if pos.dca_avg_price > 0 else step1_price
         this_tps = actual_received / step_sol if step_sol > 0 else 0
@@ -2629,9 +2593,9 @@ async def run_live_manager(interval_secs: int = 30):
     trade_budget = (usable * WALLET_UTILIZATION) / MAX_OPEN_TRADES
     print(f"\nConfig:")
     print(f"  Sizing: dynamic ({WALLET_UTILIZATION*100:.0f}% wallet / {MAX_OPEN_TRADES} trades = ~{trade_budget:.4f} SOL/trade)")
-    print(f"  DCA Steps: 15%/25%/60% at Entry/12%/28% dip")
-    print(f"  Loss exits only after Step 3 complete")
-    print(f"  Targets: Q=20% M=37% G=112% R=25%")
+    print(f"  DCA Steps: 35%/65% at Entry/10% dip (2-step system)")
+    print(f"  Stops: Q=-25% M=-25% G=-30% R=-25%")
+    print(f"  Targets: Q=50% M=80% G=150% R=40%")
     print("=" * 50 + "\n")
 
     while True:
