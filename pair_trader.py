@@ -198,16 +198,54 @@ async def init_budgets() -> list:
 # Wallet / token helpers (reused from live_trader)
 # ─────────────────────────────────────────
 
-def get_wallet_pubkey() -> Optional[str]:
-    from solders.keypair import Keypair
-    key = os.getenv("SOLANA_PRIVATE_KEY", "")
-    if not key:
-        return None
+_KEYPAIR_CACHE = None
+
+def _load_keypair():
+    """Load keypair from keys.env — handles JSON array or base58 format."""
+    global _KEYPAIR_CACHE
+    if _KEYPAIR_CACHE is not None:
+        return _KEYPAIR_CACHE
+
+    import base58 as _b58
+    key_bytes = None
+
+    # Try reading JSON array directly from file
     try:
-        kp = Keypair.from_base58_string(key)
-        return str(kp.pubkey())
+        with open("keys.env", "r") as f:
+            content = f.read()
+        start = content.find("[")
+        end = content.find("]") + 1
+        if start != -1 and end > start:
+            key_bytes = bytes(json.loads(content[start:end]))
     except:
-        return None
+        pass
+
+    # Fallback: env var (base58 or JSON string)
+    if key_bytes is None:
+        raw = os.getenv("SOLANA_PRIVATE_KEY", "")
+        if raw and raw != "your_private_key_here":
+            try:
+                key_bytes = bytes(json.loads(raw)) if raw.strip().startswith("[") else _b58.b58decode(raw)
+            except:
+                pass
+
+    if key_bytes is None:
+        _KEYPAIR_CACHE = (None, None)
+        return _KEYPAIR_CACHE
+
+    try:
+        import base58 as _b58
+        pubkey_bytes = key_bytes[32:] if len(key_bytes) == 64 else key_bytes[:32]
+        pubkey = _b58.b58encode(pubkey_bytes).decode()
+        _KEYPAIR_CACHE = (key_bytes, pubkey)
+    except:
+        _KEYPAIR_CACHE = (None, None)
+    return _KEYPAIR_CACHE
+
+
+def get_wallet_pubkey() -> Optional[str]:
+    _, pubkey = _load_keypair()
+    return pubkey or None
 
 
 async def get_sol_balance(pubkey: str) -> float:
@@ -304,10 +342,12 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slip
 
 async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
     from solders.keypair import Keypair
-    import base58, base64
+    import base64
     try:
-        key = os.getenv("SOLANA_PRIVATE_KEY", "")
-        kp = Keypair.from_base58_string(key)
+        key_bytes, _ = _load_keypair()
+        if not key_bytes:
+            return None
+        kp = Keypair.from_bytes(key_bytes)
 
         swap_url = "https://api.jup.ag/swap/v1/swap"
         headers = {
@@ -510,6 +550,10 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
 
     # ── WATCHING: waiting for entry dip ──────────────────────────────────
     if slot.status == "watching":
+        # Trail watch_price up with price — always measure dip from recent high
+        if price_sol > slot.watch_price:
+            slot.watch_price = price_sol
+
         dip_from_watch = ((slot.watch_price - price_sol) / slot.watch_price) * 100
         if dip_from_watch >= slot.entry_dip_pct:
             # Entry condition met — buy Step 1
@@ -839,11 +883,13 @@ async def cmd_positions() -> str:
 async def cmd_stats() -> str:
     """Slot budget summary."""
     budgets = load_budgets()
+    if not budgets:
+        budgets = await init_budgets()
     wallet  = get_wallet_pubkey()
     sol_bal = await get_sol_balance(wallet) if wallet else 0.0
 
     if not budgets:
-        return f"Budgets not initialised yet\nWallet: {sol_bal:.4f} SOL"
+        return f"Budgets not initialised — check wallet config\nWallet: {sol_bal:.4f} SOL"
 
     msg = f"*STATS*\nWallet: `{sol_bal:.4f}` SOL\n\n"
     for b in budgets:
