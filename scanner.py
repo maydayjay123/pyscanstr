@@ -905,53 +905,14 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
     return "\n".join(lines)
 
 
-async def run_scanner(interval_secs: int = 30, send_to_tg: bool = False, live_mode: bool = False):
-    """Run scanner loop — data collection only. Auto-buying removed."""
-    print(f"Scanner started - {interval_secs}s interval [DATA ONLY]")
-    print(f"QUICK:    ${QUICK_MC_MIN/1000:.0f}K-${QUICK_MC_MAX/1000:.0f}K  target {QUICK_TARGET}%")
-    print(f"MOMENTUM: ${MOMENTUM_MC_MIN/1000:.0f}K-${MOMENTUM_MC_MAX/1000:.0f}K target {MOMENTUM_TARGET}%")
-    print(f"GEM:      <${GEM_MC_MAX/1000:.0f}K         target {GEM_TARGET}%+")
-    print(f"RANGE:    ${RANGE_MC_MIN/1000:.0f}K-${RANGE_MC_MAX/1000:.0f}K  target {RANGE_TARGET}% (24h+ DCA)")
-    print()
-
+async def run_scanner(interval_secs: int = 60, send_to_tg: bool = False, live_mode: bool = False):
+    """Run scanner loop — silent data collection only. No console output."""
     while True:
         try:
             signals = await scan()
-
-            buys = [s for s in signals if s.signal == "BUY"]
-            watches = [s for s in signals if s.signal == "WATCH"]
-            quick = [s for s in buys if s.trade_type == "QUICK"]
-            momentum = [s for s in buys if s.trade_type == "MOMENTUM"]
-            gems = [s for s in buys if s.trade_type == "GEM"]
-            ranges = [s for s in buys if s.trade_type == "RANGE"]
-
-            ts = datetime.now().strftime('%H:%M:%S')
-            print(f"[{ts}] Scanned {len(signals)} | BUY: Q:{len(quick)} M:{len(momentum)} G:{len(gems)} R:{len(ranges)} | WATCH:{len(watches)}")
-
             save_signals(signals)
-
-            # Print by type with chart links
-            for s in quick[:3]:
-                print(f"  Q {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
-                print(f"      {s.chart}")
-            for s in momentum[:3]:
-                print(f"  M {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
-                print(f"      {s.chart}")
-            for s in gems[:3]:
-                print(f"  G {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
-                print(f"      {s.chart}")
-            for s in ranges[:3]:
-                print(f"  R {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
-                print(f"      {s.chart}")
-            for s in watches[:3]:
-                print(f"  W {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
-                print(f"      {s.chart}")
-
         except Exception as e:
-            import traceback
-            print(f"  Error: {e}")
-            traceback.print_exc()
-
+            print(f"[scanner] {e}")
         await asyncio.sleep(interval_secs)
 
 
