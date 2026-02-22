@@ -4,7 +4,8 @@ Run scanner with sim or live trading.
 Usage:
     python run.py          # Scanner + Sim (default)
     python run.py --live   # Scanner + LIVE TRADING
-    python run.py --scan   # Scanner only
+    python run.py --pair   # Pair trader (manual CA via TG)
+    python run.py --scan   # Scanner only (data collection)
     python run.py --sim    # Sim manager only
     python run.py --reset  # Reset all data
     python run.py --reset-live  # Reset live data only
@@ -148,6 +149,52 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No signals found", reply_markup=get_back_menu())
     else:
         await update.message.reply_text("No tokens found", reply_markup=get_back_menu())
+
+
+# ============== PAIR TRADER COMMANDS ==============
+
+async def cmd_trade_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /trade <CA> — queue a token for pair trader."""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /trade <contract_address>")
+        return
+    from pair_trader import cmd_trade
+    msg = await cmd_trade(ctx.args[0])
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def cmd_cancel_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /cancel <symbol|slot> — cancel a watching slot."""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /cancel <symbol> or /cancel <slot_number>")
+        return
+    from pair_trader import cmd_cancel
+    msg = await cmd_cancel(ctx.args[0])
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_close_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /close <symbol|slot> — manually close an open position."""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /close <symbol> or /close <slot_number>")
+        return
+    from pair_trader import cmd_close
+    msg = await cmd_close(ctx.args[0])
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_positions_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /pos — show pair trader slot status."""
+    from pair_trader import cmd_positions
+    msg = await cmd_positions()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_stats_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats — show slot budgets and profit summary."""
+    from pair_trader import cmd_stats
+    msg = await cmd_stats()
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ============== BUTTON CALLBACK HANDLERS ==============
@@ -699,6 +746,14 @@ async def run_bot():
     app.add_handler(CommandHandler("l", cmd_live))
     app.add_handler(CommandHandler("m", cmd_menu))
 
+    # Pair trader commands
+    app.add_handler(CommandHandler("trade", cmd_trade_handler))
+    app.add_handler(CommandHandler("cancel", cmd_cancel_handler))
+    app.add_handler(CommandHandler("close", cmd_close_handler))
+    app.add_handler(CommandHandler("pos", cmd_positions_pair))
+    app.add_handler(CommandHandler("p", cmd_positions_pair))
+    app.add_handler(CommandHandler("stats", cmd_stats_pair))
+
     # Button callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
 
@@ -707,6 +762,7 @@ async def run_bot():
     await app.updater.start_polling(drop_pending_updates=True)
 
     print("TG Bot: /start /menu /status /scan /live")
+    print("Pair:   /trade <CA>  /cancel  /close  /pos  /stats")
 
     while True:
         await asyncio.sleep(60)
@@ -864,11 +920,38 @@ async def run_live():
     )
 
 
+async def run_pair():
+    """Run pair trader (manual CA trading) + scanner data collection."""
+    from scanner import run_scanner
+    from pair_trader import run_pair_trader
+
+    print("=" * 50)
+    print("PAIR TRADER MODE")
+    print("=" * 50)
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    print("Slots:    2 manual CA slots (85% wallet)")
+    print("Trader:   30s check interval")
+    print("Scanner:  data collection only (no auto-buys)")
+    print()
+    print("Commands: /trade <CA>  /cancel  /close  /pos  /stats")
+    print("Ctrl+C to stop")
+    print("=" * 50)
+    print()
+
+    await asyncio.gather(
+        run_pair_trader(),
+        run_scanner(interval_secs=60, send_to_tg=False, live_mode=False),
+        run_bot(),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meme Scanner + Sim/Live Manager")
     parser.add_argument("--scan", action="store_true", help="Run scanner only")
     parser.add_argument("--sim", action="store_true", help="Run sim manager only")
     parser.add_argument("--live", action="store_true", help="Run with LIVE trading")
+    parser.add_argument("--pair", action="store_true", help="Run pair trader (manual CA trading)")
     parser.add_argument("--reset", action="store_true", help="Reset all data")
     parser.add_argument("--reset-live", action="store_true", help="Reset live data only")
     parser.add_argument("--no-tg", action="store_true", help="Disable Telegram output")
@@ -887,6 +970,11 @@ def main():
             asyncio.run(run_live())
         except KeyboardInterrupt:
             print("\nLive trading stopped")
+    elif args.pair:
+        try:
+            asyncio.run(run_pair())
+        except KeyboardInterrupt:
+            print("\nPair trader stopped")
     else:
         try:
             asyncio.run(run_all(no_tg=args.no_tg))

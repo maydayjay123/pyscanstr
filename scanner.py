@@ -905,19 +905,14 @@ def format_signal_msg(signals: List[TokenSignal]) -> str:
     return "\n".join(lines)
 
 
-async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mode: bool = False):
-    """Run scanner loop."""
-    mode = "LIVE" if live_mode else "SIM"
-    print(f"Scanner started - {interval_secs}s interval [{mode}]")
+async def run_scanner(interval_secs: int = 30, send_to_tg: bool = False, live_mode: bool = False):
+    """Run scanner loop — data collection only. Auto-buying removed."""
+    print(f"Scanner started - {interval_secs}s interval [DATA ONLY]")
     print(f"QUICK:    ${QUICK_MC_MIN/1000:.0f}K-${QUICK_MC_MAX/1000:.0f}K  target {QUICK_TARGET}%")
     print(f"MOMENTUM: ${MOMENTUM_MC_MIN/1000:.0f}K-${MOMENTUM_MC_MAX/1000:.0f}K target {MOMENTUM_TARGET}%")
     print(f"GEM:      <${GEM_MC_MAX/1000:.0f}K         target {GEM_TARGET}%+")
     print(f"RANGE:    ${RANGE_MC_MIN/1000:.0f}K-${RANGE_MC_MAX/1000:.0f}K  target {RANGE_TARGET}% (24h+ DCA)")
-    print(f"Telegram: {'ON' if send_to_tg else 'OFF'}\n")
-
-    # Import live trader if live mode
-    if live_mode:
-        from live_trader import process_signal as live_buy
+    print()
 
     while True:
         try:
@@ -937,44 +932,20 @@ async def run_scanner(interval_secs: int = 30, send_to_tg: bool = True, live_mod
 
             # Print by type with chart links
             for s in quick[:3]:
-                print(f"  ⚡ Q {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"  Q {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
             for s in momentum[:3]:
-                print(f"  📈 M {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"  M {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
             for s in gems[:3]:
-                print(f"  💎 G {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"  G {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
             for s in ranges[:3]:
-                print(f"  📊 R {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"  R {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
-
-            # Also show WATCH signals
             for s in watches[:3]:
-                print(f"  👀 W {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
+                print(f"  W {s.symbol.ljust(10)} {s.mc_str.ljust(7)} | {s.buy_ratio:.1f}x {s.vol_direction} | {s.reason}")
                 print(f"      {s.chart}")
-
-            # LIVE MODE: Execute buys
-            if live_mode and buys:
-                for s in buys[:2]:  # Max 2 buys per scan
-                    signal_data = {
-                        "signal": s.signal,
-                        "address": s.address,
-                        "symbol": s.symbol,
-                        "trade_type": s.trade_type,
-                        "price": s.price,
-                        "market_cap": s.mc,
-                        "buy_ratio": s.buy_ratio,
-                        "liquidity": s.liquidity,
-                    }
-                    await live_buy(signal_data)
-
-            # Send to TG if any signals (BUY or WATCH) - edits in place
-            if send_to_tg and signals:
-                msg = format_signal_msg(signals)
-                if msg:
-                    msg += f"\n_Scanned: {datetime.now().strftime('%H:%M:%S')}_"
-                    await send_tg(msg)
 
         except Exception as e:
             import traceback
