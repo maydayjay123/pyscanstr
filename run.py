@@ -22,43 +22,28 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # ============== MENU BUTTONS ==============
 
 def get_main_menu():
-    """Main menu with buttons."""
+    """Main menu — pair trader."""
     keyboard = [
         [
-            InlineKeyboardButton("📊 Positions", callback_data="positions"),
-            InlineKeyboardButton("📡 Tracking", callback_data="tracking"),
+            InlineKeyboardButton("📊 Slots", callback_data="pair_positions"),
+            InlineKeyboardButton("📈 Stats", callback_data="pair_stats"),
         ],
         [
-            InlineKeyboardButton("📈 Stats", callback_data="stats"),
-            InlineKeyboardButton("📜 History", callback_data="history"),
+            InlineKeyboardButton("💰 Wallet", callback_data="pair_wallet"),
+            InlineKeyboardButton("📜 History", callback_data="pair_history"),
         ],
         [
-            InlineKeyboardButton("💰 Wallet", callback_data="wallet"),
-            InlineKeyboardButton("🔄 Sync", callback_data="sync"),
-        ],
-        [
-            InlineKeyboardButton("🔍 Scan", callback_data="scan"),
-            InlineKeyboardButton("🚨 SELL ALL", callback_data="sell_all_confirm"),
-        ],
-        [
-            InlineKeyboardButton("💀 SELL WALLET", callback_data="sell_wallet_confirm"),
-            InlineKeyboardButton("📋 Export CSV", callback_data="export_csv"),
-        ],
-        [
-            InlineKeyboardButton("📉 Price Action", callback_data="export_price_action"),
+            InlineKeyboardButton("ℹ️ Commands", callback_data="pair_help"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_position_menu():
-    """Position view buttons."""
+    """Slot view refresh button."""
     keyboard = [
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data="positions"),
-            InlineKeyboardButton("📊 Detailed", callback_data="positions_detail"),
-        ],
-        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="pair_positions"),
             InlineKeyboardButton("🏠 Menu", callback_data="menu"),
         ],
     ]
@@ -75,9 +60,15 @@ def get_back_menu():
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - show main menu."""
-    msg = "*🚀 MEME TRADER BOT*\n\n"
-    msg += "Select an option below:"
-
+    msg = (
+        "*PAIR TRADER*\n\n"
+        "2 manual slots — you pick the CA, bot handles the rest.\n\n"
+        "*/trade <CA>* — start watching a token\n"
+        "*/cancel <sym>* — cancel before entry\n"
+        "*/close <sym>* — manually sell\n"
+        "*/pos* — slot status\n"
+        "*/stats* — budgets & profit\n"
+    )
     await update.message.reply_text(
         msg,
         parse_mode="Markdown",
@@ -87,9 +78,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /menu command."""
-    msg = "*🚀 MEME TRADER*\n\n"
-    msg += "Select an option:"
-
+    msg = "*PAIR TRADER*\n\nSelect an option:"
     await update.message.reply_text(
         msg,
         parse_mode="Markdown",
@@ -217,513 +206,80 @@ async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_button(query, data):
     """Process button callback data."""
+
     if data == "menu":
-        msg = "*🚀 MEME TRADER*\n\n"
-        msg += "Select an option:"
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_main_menu()
-        )
+        msg = "*PAIR TRADER*\n\nSelect an option:"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_menu())
 
-    elif data == "positions":
-        from live_trader import load_positions, get_token_metrics, get_token_balance_full, compute_pnl_sol, get_wallet_pubkey
+    elif data == "pair_positions":
+        from pair_trader import cmd_positions
+        msg = await cmd_positions()
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_position_menu())
 
-        positions = load_positions()
-        open_pos = [p for p in positions if p.status == "OPEN"]
+    elif data == "pair_stats":
+        from pair_trader import cmd_stats
+        msg = await cmd_stats()
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
-        if not open_pos:
-            msg = "*📊 POSITIONS*\n\n"
-            msg += "No open positions"
-        else:
-            msg = f"*📊 POSITIONS* ({len(open_pos)} open)\n\n"
-            wallet = get_wallet_pubkey()
-
-            total_pnl = 0.0
-            for p in open_pos:
-                metrics = await get_token_metrics(p.token_address)
-                entry = datetime.fromisoformat(p.entry_time)
-                held_mins = (datetime.now() - entry).total_seconds() / 60
-
-                if metrics and metrics.price > 0:
-                    # SOL-based PnL (same as detailed view + manage_positions)
-                    total_sol = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
-                    if metrics.price_sol > 0:
-                        _, ui_bal = await get_token_balance_full(wallet, p.token_address)
-                        pnl = compute_pnl_sol(total_sol, ui_bal, metrics.price_sol)
-                    else:
-                        pnl = p.pnl_percent if p.pnl_percent != 0 else 0.0
-
-                    total_pnl += pnl
-
-                    # Status emoji
-                    if pnl >= 10:
-                        emoji = "🟢"
-                    elif pnl >= 0:
-                        emoji = "🟡"
-                    else:
-                        emoji = "🔴"
-
-                    mc_str = f"{metrics.mc/1000:.0f}K" if metrics.mc < 1_000_000 else f"{metrics.mc/1_000_000:.1f}M"
-                    msg += f"{emoji} `{p.symbol}` *{pnl:+.1f}%*\n"
-                    msg += f"   MC: {mc_str} | {metrics.buy_ratio:.1f}x | {held_mins:.0f}m\n\n"
-                else:
-                    msg += f"⚪ `{p.symbol}` (no data)\n\n"
-
-            msg += f"━━━━━━━━━━━━━━\n"
-            msg += f"*Total: {total_pnl:+.1f}%*"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_position_menu()
-        )
-
-    elif data == "positions_detail":
-        from live_trader import format_live_status_detailed
-
-        msg = await format_live_status_detailed()
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=get_position_menu()
-        )
-
-    elif data == "scan":
-        from scanner import scan, format_signal_msg
-
-        await query.edit_message_text("🔍 *Scanning...*", parse_mode="Markdown")
-
-        signals = await scan()
-        if signals:
-            msg = format_signal_msg(signals)
-            if not msg:
-                msg = "No signals found"
-        else:
-            msg = "No tokens found"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "stats":
-        from live_trader import (
-            get_session_stats, format_session_summary,
-            format_alltime_stats, SESSION_ID
-        )
-
-        stats = get_session_stats()
-
-        # Session stats
-        msg = "*📊 CURRENT SESSION*\n"
-        msg += f"ID: `{SESSION_ID[:15]}...`\n\n"
-
-        # Balance tracking
-        if stats.starting_balance > 0:
-            change_sol = stats.wallet_change_sol
-            change_pct = stats.wallet_change_pct
-            bal_emoji = "🟢" if change_sol >= 0 else "🔴"
-            msg += f"*Start:* `{stats.starting_balance:.4f}` SOL\n"
-            msg += f"*Now:*   `{stats.current_balance:.4f}` SOL\n"
-            msg += f"{bal_emoji} *Change:* `{change_sol:+.4f}` SOL ({change_pct:+.1f}%)\n\n"
-
-        msg += f"Buys: {stats.buys} | Sells: {stats.sells}\n"
-        msg += f"W/L: {stats.wins}/{stats.losses}"
-        if stats.wins + stats.losses > 0:
-            msg += f" ({stats.win_rate:.0f}%)"
-        msg += "\n\n"
-        msg += f"SOL In:  `{stats.sol_in:.6f}`\n"
-        msg += f"SOL Out: `{stats.sol_out:.6f}`\n"
-        msg += f"*Net: {stats.net_pnl_sol:+.6f} SOL*"
-        if stats.sol_in > 0:
-            msg += f" ({stats.net_pnl_pct:+.1f}%)"
-        msg += "\n\n"
-
-        if stats.best_trade_symbol:
-            msg += f"Best: {stats.best_trade_symbol} +{stats.best_trade_pnl:.1f}%\n"
-        if stats.worst_trade_symbol:
-            msg += f"Worst: {stats.worst_trade_symbol} {stats.worst_trade_pnl:.1f}%\n"
-
-        # All-time stats
-        msg += "\n━━━━━━━━━━━━━━\n"
-        msg += format_alltime_stats()
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "wallet":
-        from live_trader import get_wallet_pubkey, get_sol_balance, load_positions
-
+    elif data == "pair_wallet":
+        from pair_trader import get_wallet_pubkey, get_sol_balance, load_budgets
         wallet = get_wallet_pubkey()
         if wallet:
             balance = await get_sol_balance(wallet)
-            positions = load_positions()
-            open_pos = [p for p in positions if p.status == "OPEN"]
-            used = sum(p.sol_amount for p in open_pos)
-
-            msg = "*💰 WALLET*\n\n"
-            msg += f"Address: `{wallet[:8]}...{wallet[-4:]}`\n\n"
-            msg += f"Balance: *{balance:.4f} SOL*\n"
-            msg += f"In Trades: {used:.4f} SOL\n"
-            msg += f"Available: {balance - used:.4f} SOL\n"
-        else:
-            msg = "*💰 WALLET*\n\n"
-            msg += "⚠️ No wallet configured"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "sync":
-        from live_trader import (
-            load_positions, get_wallet_pubkey, get_token_metrics,
-            get_all_token_accounts, sync_positions
-        )
-
-        await query.edit_message_text("???? *Syncing with blockchain...*", parse_mode="Markdown")
-
-        wallet = get_wallet_pubkey()
-        msg = "*???? SYNC RESULTS*\n\n"
-
-        # Use canonical sync (fixes OPEN/CLOSED mismatches)
-        sync_result = await sync_positions()
-        closed_syms = sync_result.get("closed_syms", [])
-        reopened_syms = sync_result.get("reopened_syms", [])
-
-        if closed_syms or reopened_syms:
-            msg += "*Tracked Positions:*\n"
-            if closed_syms:
-                msg += f"??? Closed: {', '.join([f'`{s}`' for s in closed_syms])}\n"
-            if reopened_syms:
-                msg += f"??? Re-opened: {', '.join([f'`{s}`' for s in reopened_syms])}\n"
-            msg += "\n"
-
-        # Find UNTRACKED tokens in wallet
-        msg += "*Wallet Scan:*\n"
-        positions = load_positions()
-        open_pos = [p for p in positions if p.status == "OPEN"]
-        tracked_addresses = {p.token_address for p in open_pos}
-
-        all_tokens = await get_all_token_accounts(wallet)
-        untracked = []
-
-        for token in all_tokens:
-            mint = token["mint"]
-            if mint not in tracked_addresses and mint != "So11111111111111111111111111111111111111112":
-                metrics = await get_token_metrics(mint)
-                if metrics and metrics.mc > 0:
-                    untracked.append({
-                        "mint": mint,
-                        "amount": token["amount"],
-                        "symbol": "???",
-                        "mc": metrics.mc,
-                        "price": metrics.price
-                    })
-
-        if untracked:
-            msg += f"?????? *{len(untracked)} UNTRACKED tokens!*\n"
-            for t in untracked[:5]:  # Show max 5
-                mc_str = f"{t['mc']/1000:.0f}K" if t['mc'] < 1_000_000 else f"{t['mc']/1_000_000:.1f}M"
-                msg += f"  ??? MC:{mc_str} `{t['mint'][:8]}...`\n"
-            if len(untracked) > 5:
-                msg += f"  _...and {len(untracked)-5} more_\n"
-            msg += "\n_These tokens are in wallet but not tracked!_"
-        else:
-            msg += "??? No untracked tokens"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-    elif data == "tracking":
-        from live_trader import get_tracked_signals_status, SIGNAL_MIN_AGE_MINS, DIP_FROM_PEAK_PCT
-
-        msg = get_tracked_signals_status()
-        msg += f"\n\n_Buy after {SIGNAL_MIN_AGE_MINS}m + {DIP_FROM_PEAK_PCT}% dip_"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "history":
-        from live_trader import load_positions
-
-        positions = load_positions()
-        closed = [p for p in positions if p.status == "CLOSED"]
-
-        msg = "*📜 TRADE HISTORY*\n\n"
-
-        if closed:
-            # Sort by exit time, most recent first
-            closed.sort(key=lambda p: p.exit_time, reverse=True)
-
-            for p in closed[:15]:  # Show last 15 trades
-                emoji = "🟢" if p.pnl_percent > 0 else "🔴"
-                exit_time = datetime.fromisoformat(p.exit_time).strftime("%m/%d %H:%M")
-                entry_time = datetime.fromisoformat(p.entry_time)
-                exit_dt = datetime.fromisoformat(p.exit_time)
-                held_mins = (exit_dt - entry_time).total_seconds() / 60
-
-                mc_str = f"{p.entry_mc/1000:.0f}K" if p.entry_mc < 1_000_000 else f"{p.entry_mc/1_000_000:.1f}M"
-
-                msg += f"{emoji} `{p.symbol}` *{p.pnl_percent:+.1f}%*\n"
-                msg += f"   {exit_time} | {held_mins:.0f}m | MC:{mc_str}\n"
-
-                # Show max vs exit for analysis
-                if p.max_pnl_percent > p.pnl_percent + 5:
-                    msg += f"   ⚠️ Max was +{p.max_pnl_percent:.0f}%\n"
-
-            if len(closed) > 15:
-                msg += f"\n_...and {len(closed)-15} more trades_"
-        else:
-            msg += "No trade history yet"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "export_csv":
-        from live_trader import load_positions
-        import io
-
-        positions = load_positions()
-        closed = [p for p in positions if p.status == "CLOSED"]
-        open_pos = [p for p in positions if p.status == "OPEN"]
-
-        if not closed and not open_pos:
-            await query.edit_message_text("No trade data to export", reply_markup=get_back_menu())
-        else:
-            # Build CSV - comprehensive analytical export
-            headers = [
-                "status", "symbol", "trade_type",
-                "entry_time", "exit_time", "held_mins",
-                "entry_mc", "max_mc", "exit_mc",
-                "entry_price", "exit_price",
-                "sol_invested", "sol_step1",
-                "pnl_pct", "max_pnl_pct",
-                "exit_reason", "dca_steps",
-                "entry_vol_5m", "entry_buys_5m", "entry_sells_5m",
-                "entry_buy_ratio", "entry_liquidity",
-                "mc_growth_pct", "token_address", "tx_hash"
-            ]
-            csv_lines = [",".join(headers)]
-            all_trades = closed + open_pos
-            all_trades.sort(key=lambda p: p.entry_time, reverse=True)
-
-            for p in all_trades:
-                entry_dt = datetime.fromisoformat(p.entry_time)
-                if p.exit_time:
-                    exit_dt = datetime.fromisoformat(p.exit_time)
-                    held = (exit_dt - entry_dt).total_seconds() / 60
-                    exit_str = exit_dt.strftime("%Y-%m-%d %H:%M")
-                else:
-                    held = (datetime.now() - entry_dt).total_seconds() / 60
-                    exit_str = ""
-
-                sol_in = p.dca_total_sol if p.dca_total_sol and p.dca_total_sol > 0 else p.sol_amount
-                steps = p.dca_step if p.dca_step else 1
-                reason = (getattr(p, 'exit_reason', '') or "").replace(",", ";")
-                entry_vol = getattr(p, 'entry_vol_5m', 0) or 0
-                entry_buys = getattr(p, 'entry_buys_5m', 0) or 0
-                entry_sells = getattr(p, 'entry_sells_5m', 0) or 0
-                entry_ratio = getattr(p, 'entry_buy_ratio', 0) or 0
-                entry_liq = getattr(p, 'entry_liquidity', 0) or 0
-                mc_growth = ((p.max_mc - p.entry_mc) / p.entry_mc * 100) if p.entry_mc > 0 else 0
-                exit_mc = getattr(p, 'last_mc', 0) or 0
-
-                csv_lines.append(
-                    f"{p.status},{p.symbol},{p.trade_type},"
-                    f"{entry_dt.strftime('%Y-%m-%d %H:%M')},{exit_str},"
-                    f"{held:.0f},{p.entry_mc:.0f},{p.max_mc:.0f},{exit_mc:.0f},"
-                    f"{p.entry_price:.10f},{p.exit_price:.10f},"
-                    f"{sol_in:.6f},{p.sol_amount:.6f},"
-                    f"{p.pnl_percent:.2f},{p.max_pnl_percent:.2f},"
-                    f"{reason},{steps},"
-                    f"{entry_vol:.0f},{entry_buys},{entry_sells},"
-                    f"{entry_ratio:.2f},{entry_liq:.0f},"
-                    f"{mc_growth:.1f},{p.token_address},{p.tx_hash or ''}"
-                )
-
-            csv_content = "\n".join(csv_lines)
-
-            # Send as document via TG API
-            try:
-                import aiohttp as aio
-                csv_bytes = csv_content.encode("utf-8")
-                form = aio.FormData()
-                form.add_field("chat_id", str(TELEGRAM_CHAT_ID))
-                form.add_field("document", csv_bytes, filename=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", content_type="text/csv")
-                form.add_field("caption", f"Trade export: {len(closed)} closed, {len(open_pos)} open")
-
-                async with aio.ClientSession() as session:
-                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-                    async with session.post(url, data=form, timeout=15) as resp:
-                        if resp.status == 200:
-                            await query.edit_message_text(f"Exported {len(all_trades)} trades as CSV", reply_markup=get_back_menu())
-                        else:
-                            await query.edit_message_text("Export failed - TG API error", reply_markup=get_back_menu())
-            except Exception as e:
-                await query.edit_message_text(f"Export error: {e}", reply_markup=get_back_menu())
-
-    elif data == "export_price_action":
-        import os
-        pa_file = "price_action.csv"
-        if not os.path.exists(pa_file):
-            await query.edit_message_text("No price action data yet - bot needs to run first", reply_markup=get_back_menu())
-        else:
-            try:
-                import aiohttp as aio
-                with open(pa_file, "rb") as f:
-                    csv_bytes = f.read()
-
-                # Count rows for caption
-                line_count = csv_bytes.count(b'\n')
-                size_kb = len(csv_bytes) / 1024
-
-                form = aio.FormData()
-                form.add_field("chat_id", str(TELEGRAM_CHAT_ID))
-                form.add_field("document", csv_bytes, filename=f"price_action_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", content_type="text/csv")
-                form.add_field("caption", f"Price action: {line_count} snapshots ({size_kb:.0f}KB)")
-
-                async with aio.ClientSession() as session:
-                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-                    async with session.post(url, data=form, timeout=30) as resp:
-                        if resp.status == 200:
-                            await query.edit_message_text(f"Exported {line_count} price snapshots", reply_markup=get_back_menu())
-                        else:
-                            await query.edit_message_text("Export failed - TG API error", reply_markup=get_back_menu())
-            except Exception as e:
-                await query.edit_message_text(f"Export error: {e}", reply_markup=get_back_menu())
-
-    elif data == "sell_all_confirm":
-        from live_trader import load_positions
-
-        positions = load_positions()
-        open_pos = [p for p in positions if p.status == "OPEN"]
-
-        if not open_pos:
-            msg = "*🚨 SELL ALL*\n\nNo open positions to sell"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
-        else:
-            msg = "*🚨 SELL ALL POSITIONS?*\n\n"
-            msg += f"This will sell *{len(open_pos)}* positions:\n\n"
-            for p in open_pos:
-                msg += f"• `{p.symbol}` ({p.sol_amount:.4f} SOL)\n"
-            msg += "\n⚠️ *This cannot be undone!*"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ YES, SELL ALL", callback_data="sell_all_execute"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="menu"),
-                ],
-            ]
-            await query.edit_message_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+            budgets = load_budgets() or []
+            invested = sum(b.budget_sol for b in budgets)
+            msg = (
+                f"*WALLET*\n\n"
+                f"`{wallet[:8]}...{wallet[-4:]}`\n\n"
+                f"Balance: *{balance:.4f} SOL*\n"
+                f"Slot budgets: {invested:.4f} SOL\n"
+                f"Free: {max(0, balance - invested):.4f} SOL"
             )
-
-    elif data == "sell_all_execute":
-        from live_trader import sell_all_positions
-
-        await query.edit_message_text("🚨 *SELLING ALL POSITIONS...*", parse_mode="Markdown")
-
-        result = await sell_all_positions("PANIC_SELL")
-
-        msg = "*🚨 SELL ALL COMPLETE*\n\n"
-        msg += f"✅ Sold: {result['sold']}\n"
-        if result['failed'] > 0:
-            msg += f"❌ Failed: {result['failed']}\n"
-        msg += f"\n*Total PnL: {result['total_pnl']:+.1f}%*"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
-        )
-
-    elif data == "sell_wallet_confirm":
-        from live_trader import get_all_token_accounts, get_wallet_pubkey, load_positions
-
-        wallet = get_wallet_pubkey()
-        if not wallet:
-            await query.edit_message_text("⚠️ No wallet configured", parse_mode="Markdown", reply_markup=get_back_menu())
-            return
-
-        # Count all tokens in wallet
-        all_tokens = await get_all_token_accounts(wallet)
-        positions = load_positions()
-        tracked_addresses = {p.token_address for p in positions if p.status == "OPEN"}
-
-        # Filter out native SOL
-        sol_mint = "So11111111111111111111111111111111111111112"
-        token_count = len([t for t in all_tokens if t["mint"] != sol_mint and t["amount"] > 0])
-        untracked_count = len([t for t in all_tokens if t["mint"] != sol_mint and t["amount"] > 0 and t["mint"] not in tracked_addresses])
-
-        if token_count == 0:
-            msg = "*💀 SELL WALLET*\n\nNo tokens in wallet"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
         else:
-            msg = "*💀 SELL ALL WALLET TOKENS?*\n\n"
-            msg += f"This will sell *{token_count}* tokens:\n"
-            msg += f"• {len(tracked_addresses)} tracked positions\n"
-            msg += f"• {untracked_count} UNTRACKED tokens\n\n"
-            msg += "⚠️ *Sells EVERYTHING including untracked!*"
+            msg = "*WALLET*\n\n⚠️ No wallet configured"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
-            keyboard = [
-                [
-                    InlineKeyboardButton("💀 YES, SELL WALLET", callback_data="sell_wallet_execute"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="menu"),
-                ],
-            ]
-            await query.edit_message_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+    elif data == "pair_history":
+        import os, csv as _csv
+        from pair_trader import TRADES_FILE
+        msg = "*TRADE HISTORY*\n\n"
+        if not os.path.exists(TRADES_FILE):
+            msg += "No trades yet"
+        else:
+            rows = []
+            with open(TRADES_FILE) as f:
+                reader = _csv.DictReader(f)
+                rows = list(reader)
+            if not rows:
+                msg += "No trades yet"
+            else:
+                rows = rows[-15:][::-1]  # last 15, newest first
+                for r in rows:
+                    pnl = float(r.get("pnl_pct", 0))
+                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    sym = r.get("symbol", "?")
+                    held = r.get("held_mins", "?")
+                    reason = r.get("exit_reason", "")[:20]
+                    msg += f"{emoji} `{sym}` *{pnl:+.1f}%* | {held}m | {reason}\n"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
-    elif data == "sell_wallet_execute":
-        from live_trader import sell_all_wallet_tokens
-
-        await query.edit_message_text("💀 *SELLING ALL WALLET TOKENS...*", parse_mode="Markdown")
-
-        result = await sell_all_wallet_tokens()
-
-        msg = "*💀 WALLET CLEARED*\n\n"
-        msg += f"✅ Sold: {result['sold']}\n"
-        if result['failed'] > 0:
-            msg += f"❌ Failed: {result['failed']}\n"
-        msg += f"\n*SOL recovered: {result.get('total_sol', 0):.6f}*"
-
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_back_menu()
+    elif data == "pair_help":
+        msg = (
+            "*COMMANDS*\n\n"
+            "*/trade <CA>* — watch token, auto-enter on dip\n"
+            "*/cancel <sym>* — cancel before entry\n"
+            "*/close <sym>* — manually sell now\n"
+            "*/pos* — slot status + live PnL\n"
+            "*/stats* — budgets & profit per slot\n\n"
+            "*How it works:*\n"
+            "1. Send /trade with a contract address\n"
+            "2. Bot watches price, waits for MC-based dip\n"
+            "3. Buys Step 1 (15%) on dip\n"
+            "4. Step 2 (25%) and Step 3 (60%) auto-buy on deeper dips\n"
+            "5. Trail TP: activates at +12%, sits 4% below peak\n"
+            "6. On close → auto re-watches same token"
         )
-
-    elif data == "refresh":
-        msg = "*🚀 MEME TRADER*\n\n"
-        msg += f"_Updated: {datetime.now().strftime('%H:%M:%S')}_\n\n"
-        msg += "Select an option:"
-        await query.edit_message_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=get_main_menu()
-        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
 
 # ============== BOT RUNNER ==============
