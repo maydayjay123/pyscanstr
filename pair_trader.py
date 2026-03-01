@@ -32,7 +32,7 @@ SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.sola
 MAX_SLIPPAGE_BPS    = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "15")) * 100)
 MIN_FEE_RESERVE     = float(os.getenv("MIN_FEE_RESERVE", "0.005"))
 WALLET_UTILIZATION  = 0.85
-NUM_SLOTS           = 2
+NUM_SLOTS           = 4
 DCA_SPLITS          = [0.15, 0.25, 0.60]   # step1 / step2 / step3
 
 SOL_MINT            = "So11111111111111111111111111111111111111112"
@@ -890,6 +890,32 @@ async def cmd_positions() -> str:
             msg += f"  Budget: {budget_str}\n\n"
 
     return msg
+
+
+async def cmd_closeall() -> str:
+    """Force-sell all open positions immediately."""
+    slots   = load_slots()
+    budgets = load_budgets() or await init_budgets()
+    wallet  = get_wallet_pubkey()
+    if not wallet:
+        return "Wallet not configured"
+
+    open_slots = [s for s in slots if s.status == "open"]
+    if not open_slots:
+        return "No open positions to close"
+
+    results = []
+    for s in open_slots:
+        budget = next((b for b in budgets if b.slot_id == s.slot_id), None)
+        if not budget:
+            results.append(f"Slot {s.slot_id} `{s.symbol}` — budget missing, skipped")
+            continue
+        price_sol, price_usd, _ = await get_token_price_and_mc(s.token_address)
+        await _close_slot(s, budget, wallet, price_sol, price_usd, "CLOSEALL")
+        results.append(f"Slot {s.slot_id} `{s.symbol}` — closed")
+
+    save_slots(slots)
+    return "Force close all:\n" + "\n".join(results)
 
 
 async def cmd_resetbudget() -> str:

@@ -193,6 +193,14 @@ async def cmd_resetbudget_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_closeall_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /closeall — force sell every open position."""
+    from pair_trader import cmd_closeall
+    await update.message.reply_text("Closing all positions...")
+    msg = await cmd_closeall()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # ============== BUTTON CALLBACK HANDLERS ==============
 
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +326,7 @@ async def run_bot():
     app.add_handler(CommandHandler("stats", cmd_stats_pair))
     app.add_handler(CommandHandler("resetbudget", cmd_resetbudget_handler))
     app.add_handler(CommandHandler("rb", cmd_resetbudget_handler))
+    app.add_handler(CommandHandler("closeall", cmd_closeall_handler))
 
     # Button callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
