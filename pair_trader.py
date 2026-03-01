@@ -178,12 +178,21 @@ def save_pair_history(history: dict):
         json.dump(history, f, indent=2)
 
 
+MIN_TRADE_SOL = 0.002   # minimum SOL to attempt a buy
+
 async def init_budgets() -> list:
-    """Initialise slot budgets from current wallet balance if not already saved."""
+    """Initialise slot budgets from current wallet balance.
+    Re-initialises if saved budgets are effectively zero (wallet was empty at startup)."""
     existing = load_budgets()
     if existing:
-        return existing
-    sol = await get_sol_balance(get_wallet_pubkey())
+        total = sum(b.budget_sol for b in existing)
+        if total >= MIN_TRADE_SOL:
+            return existing
+        # Budgets saved but all near-zero — wallet was empty; re-init now
+        print("Budgets near-zero, re-initialising from wallet...")
+
+    wallet = get_wallet_pubkey()
+    sol = await get_sol_balance(wallet) if wallet else 0.0
     usable = max(0.0, sol - MIN_FEE_RESERVE)
     per_slot = (usable * WALLET_UTILIZATION) / NUM_SLOTS
     budgets = [
@@ -191,6 +200,7 @@ async def init_budgets() -> list:
         for i in range(1, NUM_SLOTS + 1)
     ]
     save_budgets(budgets)
+    print(f"Budgets initialised: {per_slot:.4f} SOL per slot (wallet: {sol:.4f} SOL)")
     return budgets
 
 
@@ -393,6 +403,8 @@ async def execute_swap(quote: dict, wallet_pubkey: str) -> Optional[str]:
 
 async def buy_tokens(sol_amount: float, token_address: str, wallet: str) -> tuple:
     """Buy tokens with SOL. Returns (tx_hash, tokens_received)."""
+    if sol_amount < MIN_TRADE_SOL:
+        return (None, 0)   # silently skip — not enough SOL
     lamports = int(sol_amount * 1_000_000_000)
     for attempt in range(2):
         slippage = MAX_SLIPPAGE_BPS if attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.3)
@@ -560,7 +572,7 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             step1_sol = budget.budget_sol * DCA_SPLITS[0]
             tx, tokens = await buy_tokens(step1_sol, slot.token_address, wallet)
             if not tx:
-                await notify(f"⚠️ `{slot.symbol}` Step 1 buy failed — still watching")
+                print(f"[{slot.symbol}] Step 1 buy failed (sol: {step1_sol:.4f}) — still watching")
                 return slot
 
             # Pre-calculate Step 2 and 3 trigger prices
@@ -878,6 +890,20 @@ async def cmd_positions() -> str:
             msg += f"  Budget: {budget_str}\n\n"
 
     return msg
+
+
+async def cmd_resetbudget() -> str:
+    """Force re-initialise slot budgets from current wallet balance."""
+    import os as _os
+    if _os.path.exists(BUDGETS_FILE):
+        _os.remove(BUDGETS_FILE)
+    budgets = await init_budgets()
+    if not budgets:
+        return "Reset failed — wallet not configured"
+    global _BUDGETS_CACHE
+    _BUDGETS_CACHE = budgets
+    lines = [f"Slot {b.slot_id}: {b.budget_sol:.4f} SOL" for b in budgets]
+    return "Budget reset from wallet:\n" + "\n".join(lines)
 
 
 async def cmd_stats() -> str:
