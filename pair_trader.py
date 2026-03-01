@@ -137,7 +137,14 @@ def load_slots() -> list:
     try:
         with open(SLOTS_FILE) as f:
             raw = json.load(f)
-        return [PairSlot(**s) for s in raw]
+        slots = [PairSlot(**s) for s in raw]
+        # If NUM_SLOTS increased, add the missing empty slots
+        existing_ids = {s.slot_id for s in slots}
+        for i in range(1, NUM_SLOTS + 1):
+            if i not in existing_ids:
+                slots.append(PairSlot(slot_id=i, status="empty"))
+        slots.sort(key=lambda s: s.slot_id)
+        return slots
     except:
         return [PairSlot(slot_id=i, status="empty") for i in range(1, NUM_SLOTS + 1)]
 
