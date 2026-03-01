@@ -62,7 +62,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - show main menu."""
     msg = (
         "*PAIR TRADER*\n\n"
-        "2 manual slots — you pick the CA, bot handles the rest.\n\n"
+        "4 manual slots — you pick the CA, bot handles the rest.\n\n"
         "*/trade <CA>* — start watching a token\n"
         "*/cancel <sym>* — cancel before entry\n"
         "*/close <sym>* — manually sell\n"
