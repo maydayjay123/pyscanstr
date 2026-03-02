@@ -33,6 +33,7 @@ def get_main_menu():
             InlineKeyboardButton("📜 History", callback_data="pair_history"),
         ],
         [
+            InlineKeyboardButton("📥 Export CSV", callback_data="pair_export"),
             InlineKeyboardButton("ℹ️ Commands", callback_data="pair_help"),
         ],
     ]
@@ -62,7 +63,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - show main menu."""
     msg = (
         "*PAIR TRADER*\n\n"
-        "4 manual slots — you pick the CA, bot handles the rest.\n\n"
+        "4 manual slots — you pick the CA, bot handles the rest.\n"
+        "_Trail TP is dynamic to token MC. Never exits at a loss._\n\n"
         "*/trade <CA>* — start watching a token\n"
         "*/cancel <sym>* — cancel before entry\n"
         "*/close <sym>* — manually sell\n"
@@ -201,6 +203,18 @@ async def cmd_closeall_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_export_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /export — send pair_trades.csv as a file."""
+    import os
+    from pair_trader import TRADES_FILE
+    if not os.path.exists(TRADES_FILE):
+        await update.message.reply_text("No trade data yet — pair_trades.csv doesn't exist")
+        return
+    with open(TRADES_FILE, "rb") as f:
+        await update.message.reply_document(document=f, filename="pair_trades.csv",
+                                            caption="Trade history CSV")
+
+
 # ============== BUTTON CALLBACK HANDLERS ==============
 
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -278,6 +292,18 @@ async def _handle_button(query, data):
                     msg += f"{emoji} `{sym}` *{pnl:+.1f}%* | {held}m | {reason}\n"
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
+    elif data == "pair_export":
+        import os
+        from pair_trader import TRADES_FILE
+        if os.path.exists(TRADES_FILE):
+            import csv as _csv
+            with open(TRADES_FILE) as f:
+                rows = list(_csv.DictReader(f))
+            msg = f"*EXPORT*\n\n{len(rows)} trades in pair_trades.csv\nSend /export to receive the file"
+        else:
+            msg = "*EXPORT*\n\nNo trades yet — pair_trades.csv doesn't exist"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
+
     elif data == "pair_help":
         msg = (
             "*COMMANDS*\n\n"
@@ -291,7 +317,7 @@ async def _handle_button(query, data):
             "2. Bot watches price, waits for MC-based dip\n"
             "3. Buys Step 1 (15%) on dip\n"
             "4. Step 2 (25%) and Step 3 (60%) auto-buy on deeper dips\n"
-            "5. Trail TP: activates at +12%, sits 4% below peak\n"
+            "5. Trail TP: dynamic by MC (8-15% activate, 3-6% trail)\n"
             "6. On close → auto re-watches same token"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
@@ -327,6 +353,7 @@ async def run_bot():
     app.add_handler(CommandHandler("resetbudget", cmd_resetbudget_handler))
     app.add_handler(CommandHandler("rb", cmd_resetbudget_handler))
     app.add_handler(CommandHandler("closeall", cmd_closeall_handler))
+    app.add_handler(CommandHandler("export", cmd_export_handler))
 
     # Button callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -504,7 +531,7 @@ async def run_pair():
     print("=" * 50)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    print("Slots:    2 manual CA slots (85% wallet)")
+    print("Slots:    4 manual CA slots (85% wallet)")
     print("Trader:   30s check interval")
     print("Scanner:  data collection only (no auto-buys)")
     print()

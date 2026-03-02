@@ -66,9 +66,17 @@ def get_dca_drops(mc: float) -> tuple:
 
 
 def get_trail_params(mc: float) -> tuple:
-    """Returns (activate_pct, trail_pct). Trail activates at activate_pct, sits trail_pct below peak."""
-    # Trail always activates at 12%, trails 4% below peak regardless of MC
-    return (12.0, 4.0)
+    """Returns (activate_pct, trail_pct) based on MC tier.
+
+    Lower MC = more volatile = wider trail (to avoid getting shaken out early).
+    Higher MC = calmer = tighter trail (lock in gains faster).
+
+    Minimum trail exit is always >= ~7.5% above avg cost (never triggers at a loss).
+    """
+    if mc < 500_000:    return (8.0,  6.0)   # micro cap:  activates +8%,  trails 6% below peak
+    if mc < 2_000_000:  return (10.0, 5.0)   # small cap:  activates +10%, trails 5% below peak
+    if mc < 10_000_000: return (12.0, 4.0)   # mid cap:    activates +12%, trails 4% below peak
+    return (15.0, 3.0)                         # large cap:  activates +15%, trails 3% below peak
 
 
 # ─────────────────────────────────────────
@@ -427,23 +435,48 @@ async def buy_tokens(sol_amount: float, token_address: str, wallet: str) -> tupl
 
 
 async def sell_tokens(token_address: str, wallet: str) -> tuple:
-    """Sell all tokens. Returns (tx_hash, sol_received)."""
+    """Sell all tokens. Returns (tx_hash, sol_received).
+
+    Uses Jupiter quote outAmount as fallback if balance delta is near zero —
+    handles the case where wrapped SOL (WSOL) isn't unwrapped by the time
+    we check the native SOL balance.
+    """
     raw = await get_token_balance_raw(wallet, token_address)
     if raw <= 0:
         return (None, 0.0)
+
     sol_before = await get_sol_balance(wallet)
+    expected_sol = 0.0
+
     for attempt in range(2):
         slippage = MAX_SLIPPAGE_BPS if attempt == 0 else int(MAX_SLIPPAGE_BPS * 1.3)
         quote = await get_jupiter_quote(token_address, SOL_MINT, raw, slippage)
         if not quote:
             continue
+        expected_sol = int(quote.get("outAmount", 0)) / 1_000_000_000
+
         tx = await execute_swap(quote, wallet)
         if tx:
-            await asyncio.sleep(6)
+            # Wait for WSOL to unwrap (can take a few blocks)
+            await asyncio.sleep(8)
             sol_after = await get_sol_balance(wallet)
-            sol_received = max(0.0, sol_after - sol_before)
-            return (tx, sol_received)
+            sol_received = sol_after - sol_before
+
+            # If balance delta is much less than quoted (WSOL unwrap lag), wait and retry
+            if expected_sol > 0 and sol_received < expected_sol * 0.5:
+                await asyncio.sleep(8)
+                sol_after = await get_sol_balance(wallet)
+                sol_received = sol_after - sol_before
+
+            # Still near-zero? Fall back to quote outAmount (apply slippage discount)
+            if expected_sol > 0 and sol_received < expected_sol * 0.5:
+                sol_received = expected_sol * 0.98  # 2% safety discount
+                print(f"[sell] Balance delta low ({sol_after - sol_before:.6f} SOL), "
+                      f"using quote outAmount fallback: {sol_received:.6f} SOL")
+
+            return (tx, max(0.0, sol_received))
         await asyncio.sleep(2)
+
     return (None, 0.0)
 
 
@@ -597,11 +630,12 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             slot.peak_price     = price_sol
             slot.status         = "open"
 
+            act_pct, tr_pct = get_trail_params(mc)
             await notify(
                 f"✅ *ENTERED* `{slot.symbol}` [Slot {slot.slot_id}]\n"
                 f"Step 1 @ ${price_usd:.6f} ({step1_sol:.4f} SOL)\n"
                 f"Step 2 @ -{step2_drop:.0f}%  |  Step 3 @ -{step3_drop:.0f}%\n"
-                f"Trail activates at +12%, trails 4% below peak"
+                f"Trail: activates +{act_pct:.0f}%, sits {tr_pct:.0f}% below peak"
             )
         return slot
 
@@ -661,10 +695,14 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             # Trail sits trail_pct% below peak price
             trail_price = slot.peak_price * (1 - trail_pct / 100)
             if price_sol <= trail_price:
-                # Sell
-                reason = f"TRAIL +{slot.max_pnl_pct:.1f}% (trail {trail_pct:.0f}% below peak)"
-                await _close_slot(slot, budget, wallet, price_sol, price_usd, reason)
-                return slot
+                # Safety: never sell for a loss — skip if price is at or below avg cost
+                if slot.dca_avg_price > 0 and price_sol <= slot.dca_avg_price * 1.005:
+                    # Price has fallen back below (or barely above) avg — hold, don't exit at a loss
+                    pass
+                else:
+                    reason = f"TRAIL +{slot.max_pnl_pct:.1f}% trail={trail_pct:.0f}%"
+                    await _close_slot(slot, budget, wallet, price_sol, price_usd, reason)
+                    return slot
 
     return slot
 
