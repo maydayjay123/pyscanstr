@@ -34,6 +34,7 @@ MIN_FEE_RESERVE     = float(os.getenv("MIN_FEE_RESERVE", "0.005"))
 WALLET_UTILIZATION  = 0.85
 NUM_SLOTS           = 4
 DCA_SPLITS          = [0.15, 0.25, 0.60]   # step1 / step2 / step3
+DCA_CRASH_GUARD     = 2.0   # Skip DCA if price is more than 2× below trigger (crashed too hard)
 
 SOL_MINT            = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -676,39 +677,73 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
 
         # ── DCA Step 2 ──
         if slot.dca_step == 1 and price_sol <= slot.step2_price:
-            step2_sol = budget.budget_sol * DCA_SPLITS[1]
-            tx, tokens = await buy_tokens(step2_sol, slot.token_address, wallet)
-            if tx:
-                slot.step2_sol = step2_sol
-                slot.total_sol_invested += step2_sol
-                slot.token_amount += tokens
-                slot.dca_step = 2
-                # Recalculate average price
-                slot.dca_avg_price = slot.entry_price * (slot.step1_sol / slot.total_sol_invested) + \
-                                     price_sol * (step2_sol / slot.total_sol_invested)
+            step2_drop_pct = ((slot.entry_price - slot.step2_price) / slot.entry_price) * 100
+            crash_floor    = slot.entry_price * (1 - step2_drop_pct * DCA_CRASH_GUARD / 100)
+
+            if price_sol < crash_floor:
+                # Price crashed way past trigger — skip DCA, don't buy into a dump
+                actual_drop = ((slot.entry_price - price_sol) / slot.entry_price) * 100
+                slot.dca_step = 2  # mark step used so we don't loop here forever
                 await notify(
-                    f"📉 *DCA Step 2* `{slot.symbol}` [Slot {slot.slot_id}]\n"
-                    f"Bought @ ${price_usd:.6f} ({step2_sol:.4f} SOL)\n"
-                    f"New avg: ${slot.dca_avg_price:.8f} | PnL: {pnl_pct:+.1f}%"
+                    f"⚠️ *DCA Step 2 SKIPPED* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                    f"Price -{actual_drop:.1f}% (trigger was -{step2_drop_pct:.0f}%, max allowed -{step2_drop_pct * DCA_CRASH_GUARD:.0f}%)\n"
+                    f"Crash guard fired — holding step 1 only. Use /close to exit."
                 )
+            else:
+                step2_sol = budget.budget_sol * DCA_SPLITS[1]
+                tx, tokens = await buy_tokens(step2_sol, slot.token_address, wallet)
+                if tx:
+                    slot.step2_sol = step2_sol
+                    slot.total_sol_invested += step2_sol
+                    slot.token_amount += tokens
+                    slot.dca_step = 2
+                    slot.dca_avg_price = (
+                        slot.entry_price * (slot.step1_sol / slot.total_sol_invested)
+                        + price_sol * (step2_sol / slot.total_sol_invested)
+                    )
+                    new_pnl = ((price_sol - slot.dca_avg_price) / slot.dca_avg_price) * 100
+                    avg_usd  = slot.dca_avg_price * (price_usd / price_sol) if price_sol > 0 else 0
+                    await notify(
+                        f"📉 *DCA Step 2* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                        f"Bought @ ${price_usd:.6f} ({step2_sol:.4f} SOL)\n"
+                        f"New avg: ${avg_usd:.6f} ({slot.dca_avg_price:.8f} SOL)\n"
+                        f"PnL vs avg: {new_pnl:+.1f}%"
+                    )
 
         # ── DCA Step 3 ──
         elif slot.dca_step == 2 and price_sol <= slot.step3_price:
-            step3_sol = budget.budget_sol * DCA_SPLITS[2]
-            tx, tokens = await buy_tokens(step3_sol, slot.token_address, wallet)
-            if tx:
-                slot.step3_sol = step3_sol
-                slot.total_sol_invested += step3_sol
-                slot.token_amount += tokens
-                slot.dca_step = 3
-                # Recalculate weighted average
-                prev_weight = slot.total_sol_invested - step3_sol
-                slot.dca_avg_price = (slot.dca_avg_price * prev_weight + price_sol * step3_sol) / slot.total_sol_invested
+            step3_drop_pct = ((slot.entry_price - slot.step3_price) / slot.entry_price) * 100
+            crash_floor    = slot.entry_price * (1 - step3_drop_pct * DCA_CRASH_GUARD / 100)
+
+            if price_sol < crash_floor:
+                actual_drop = ((slot.entry_price - price_sol) / slot.entry_price) * 100
+                slot.dca_step = 3  # mark used
                 await notify(
-                    f"📉 *DCA Step 3 (MAX)* `{slot.symbol}` [Slot {slot.slot_id}]\n"
-                    f"Bought @ ${price_usd:.6f} ({step3_sol:.4f} SOL)\n"
-                    f"New avg: ${slot.dca_avg_price:.8f} | PnL: {pnl_pct:+.1f}%"
+                    f"⚠️ *DCA Step 3 SKIPPED* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                    f"Price -{actual_drop:.1f}% (trigger was -{step3_drop_pct:.0f}%, max allowed -{step3_drop_pct * DCA_CRASH_GUARD:.0f}%)\n"
+                    f"Crash guard fired — holding current position. Use /close to exit."
                 )
+            else:
+                step3_sol = budget.budget_sol * DCA_SPLITS[2]
+                tx, tokens = await buy_tokens(step3_sol, slot.token_address, wallet)
+                if tx:
+                    slot.step3_sol = step3_sol
+                    slot.total_sol_invested += step3_sol
+                    slot.token_amount += tokens
+                    slot.dca_step = 3
+                    prev_weight = slot.total_sol_invested - step3_sol
+                    slot.dca_avg_price = (
+                        (slot.dca_avg_price * prev_weight + price_sol * step3_sol)
+                        / slot.total_sol_invested
+                    )
+                    new_pnl = ((price_sol - slot.dca_avg_price) / slot.dca_avg_price) * 100
+                    avg_usd  = slot.dca_avg_price * (price_usd / price_sol) if price_sol > 0 else 0
+                    await notify(
+                        f"📉 *DCA Step 3 (MAX)* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                        f"Bought @ ${price_usd:.6f} ({step3_sol:.4f} SOL)\n"
+                        f"New avg: ${avg_usd:.6f} ({slot.dca_avg_price:.8f} SOL)\n"
+                        f"PnL vs avg: {new_pnl:+.1f}%"
+                    )
 
         # ── Trailing TP ──
         activate_pct, trail_pct = get_trail_params(mc)
@@ -720,10 +755,10 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             # Trail sits trail_pct% below peak price
             trail_price = slot.peak_price * (1 - trail_pct / 100)
             if price_sol <= trail_price:
-                # Safety: never sell for a loss — skip if price is at or below avg cost
-                if slot.dca_avg_price > 0 and price_sol <= slot.dca_avg_price * 1.005:
-                    # Price has fallen back below (or barely above) avg — hold, don't exit at a loss
-                    pass
+                # No-loss guard: require at least +2% above avg before trail exits
+                # (buffers for slippage — actual SOL received may be slightly below price-implied PnL)
+                if slot.dca_avg_price > 0 and price_sol <= slot.dca_avg_price * 1.02:
+                    pass  # hold — not enough profit to cover slippage
                 else:
                     reason = f"TRAIL +{slot.max_pnl_pct:.1f}% trail={trail_pct:.0f}%"
                     await _close_slot(slot, budget, wallet, price_sol, price_usd, reason)
