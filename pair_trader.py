@@ -43,6 +43,7 @@ SLOTS_FILE          = "pair_slots.json"
 BUDGETS_FILE        = "slot_budgets.json"
 PAIR_HISTORY_FILE   = "pair_history.json"
 TRADES_FILE         = "pair_trades.csv"
+PRICE_DATA_FILE     = "price_data.csv"
 
 
 # ─────────────────────────────────────────
@@ -50,19 +51,17 @@ TRADES_FILE         = "pair_trades.csv"
 # ─────────────────────────────────────────
 
 def get_entry_dip(mc: float) -> float:
-    """How far to wait for price to dip before Step 1 entry (% from current price)."""
-    if mc < 500_000:   return 10.0
-    if mc < 2_000_000: return 7.0
-    if mc < 10_000_000:return 5.0
-    return 3.0
+    """How far to wait for price to dip before Step 1 entry (% from current price).
+    Kept tight to catch volume moves quickly — never exceeds 4%."""
+    if mc < 500_000:    return 4.0
+    if mc < 2_000_000:  return 3.0
+    if mc < 10_000_000: return 2.5
+    return 2.0
 
 
 def get_dca_drops(mc: float) -> tuple:
-    """Step 2 and Step 3 drop % from Step 1 entry price."""
-    if mc < 500_000:    return (15.0, 35.0)
-    if mc < 2_000_000:  return (10.0, 25.0)
-    if mc < 10_000_000: return (7.0,  18.0)
-    return (5.0, 12.0)
+    """Step 2 and Step 3 drop % from Step 1 entry price. Fixed levels."""
+    return (8.0, 14.0)   # step2 at -8%, step3 at -14% from entry
 
 
 def get_trail_params(mc: float) -> tuple:
@@ -524,6 +523,30 @@ def log_trade_csv(slot: PairSlot):
                     slot.exit_reason, slot.dca_step, slot.exit_tx])
 
 
+def log_price_data(slot: PairSlot, price_sol: float, price_usd: float, mc: float):
+    """Append one price tick to price_data.csv for every active slot, every cycle.
+    Used for post-trade analysis and strategy learning."""
+    import csv
+    pnl_pct = 0.0
+    if slot.status == "open" and slot.dca_avg_price > 0 and price_sol > 0:
+        pnl_pct = ((price_sol - slot.dca_avg_price) / slot.dca_avg_price) * 100
+    file_exists = os.path.exists(PRICE_DATA_FILE)
+    with open(PRICE_DATA_FILE, "a", newline="") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(["timestamp", "slot_id", "symbol", "token_address",
+                        "status", "price_sol", "price_usd", "mc_usd",
+                        "pnl_pct", "dca_step", "avg_cost_sol"])
+        w.writerow([
+            datetime.now().isoformat(),
+            slot.slot_id, slot.symbol, slot.token_address,
+            slot.status,
+            f"{price_sol:.12f}", f"{price_usd:.8f}", f"{mc:.0f}",
+            f"{pnl_pct:.2f}", slot.dca_step,
+            f"{slot.dca_avg_price:.12f}",
+        ])
+
+
 # ─────────────────────────────────────────
 # Pair history — learns entry dip per coin
 # ─────────────────────────────────────────
@@ -599,6 +622,8 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
     price_sol, price_usd, mc = await get_token_price_and_mc(slot.token_address)
     if price_sol <= 0:
         return slot
+
+    log_price_data(slot, price_sol, price_usd, mc)
 
     # ── WATCHING: waiting for entry dip ──────────────────────────────────
     if slot.status == "watching":
@@ -904,7 +929,7 @@ async def cmd_close(symbol_or_slot: str) -> str:
 
 
 async def cmd_positions() -> str:
-    """Return formatted positions string."""
+    """Return rich formatted positions with live prices and all targets."""
     slots = load_slots()
     budgets = load_budgets() or []
     budget_map = {b.slot_id: b for b in budgets}
@@ -918,21 +943,60 @@ async def cmd_positions() -> str:
         b = budget_map.get(s.slot_id)
         budget_str = f"{b.budget_sol:.4f} SOL" if b else "?"
 
+        price_sol, price_usd, mc = await get_token_price_and_mc(s.token_address)
+        usd_ratio = (price_usd / price_sol) if price_sol > 0 else 0.0
+
         if s.status == "watching":
-            msg += f"*Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
-            msg += f"  Waiting for -{s.entry_dip_pct:.1f}% dip\n"
-            msg += f"  Budget: {budget_str}\n\n"
-        elif s.status == "open":
-            price_sol, price_usd, _ = await get_token_price_and_mc(s.token_address)
-            if price_sol > 0 and s.dca_avg_price > 0:
-                pnl = ((price_sol - s.dca_avg_price) / s.dca_avg_price) * 100
+            target_sol = s.watch_price * (1 - s.entry_dip_pct / 100)
+            target_usd = target_sol * usd_ratio
+
+            if price_sol > 0 and s.watch_price > 0:
+                current_dip = ((s.watch_price - price_sol) / s.watch_price) * 100
+                still_needed = max(0.0, s.entry_dip_pct - current_dip)
+                msg += f"*Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
+                msg += f"  Live:   ${price_usd:.8f}\n"
+                msg += f"  Entry target: ${target_usd:.8f} (-{s.entry_dip_pct:.1f}% from high)\n"
+                if still_needed > 0.05:
+                    msg += f"  Dip so far: {current_dip:.1f}% | Still need: {still_needed:.1f}%\n"
+                else:
+                    msg += f"  Dip so far: {current_dip:.1f}% — *near entry!*\n"
             else:
-                pnl = 0.0
-            trail_str = "ACTIVE" if s.trail_active else f"triggers at +12%"
-            msg += f"*Slot {s.slot_id} — OPEN* `{s.symbol}` (step {s.dca_step}/3)\n"
-            msg += f"  PnL: *{pnl:+.1f}%* | Max: {s.max_pnl_pct:+.1f}%\n"
-            msg += f"  Invested: {s.total_sol_invested:.4f} SOL | Trail: {trail_str}\n"
+                msg += f"*Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
+                msg += f"  Entry target: -{s.entry_dip_pct:.1f}% dip | price unavailable\n"
             msg += f"  Budget: {budget_str}\n\n"
+
+        elif s.status == "open":
+            pnl = ((price_sol - s.dca_avg_price) / s.dca_avg_price) * 100 \
+                  if price_sol > 0 and s.dca_avg_price > 0 else 0.0
+            avg_usd  = s.dca_avg_price * usd_ratio
+            mc_use   = s.entry_mc if s.entry_mc > 0 else mc
+            activate_pct, trail_pct = get_trail_params(mc_use)
+
+            msg += f"*Slot {s.slot_id} — OPEN* `{s.symbol}` [step {s.dca_step}/3]\n"
+            msg += f"  Live: ${price_usd:.8f} | Avg: ${avg_usd:.8f}\n"
+            msg += f"  PnL: *{pnl:+.1f}%* | Max: {s.max_pnl_pct:+.1f}%\n"
+
+            # DCA targets still pending
+            if s.dca_step == 1:
+                msg += f"  Step 2 target: ${s.step2_price * usd_ratio:.8f} (-8% from entry)\n"
+                msg += f"  Step 3 target: ${s.step3_price * usd_ratio:.8f} (-14% from entry)\n"
+            elif s.dca_step == 2:
+                msg += f"  Step 3 target: ${s.step3_price * usd_ratio:.8f} (-14% from entry)\n"
+            else:
+                msg += f"  Fully invested (all 3 steps)\n"
+
+            # Trail status
+            if s.trail_active:
+                trail_stop_sol = s.peak_price * (1 - trail_pct / 100)
+                trail_stop_usd = trail_stop_sol * usd_ratio
+                peak_usd = s.peak_price * usd_ratio
+                msg += f"  Trail: *ACTIVE* | Stop ${trail_stop_usd:.8f} ({trail_pct:.0f}% below peak ${peak_usd:.8f})\n"
+            else:
+                trail_trigger_sol = s.dca_avg_price * (1 + activate_pct / 100)
+                trail_trigger_usd = trail_trigger_sol * usd_ratio
+                msg += f"  Trail activates at +{activate_pct:.0f}% → ${trail_trigger_usd:.8f}\n"
+
+            msg += f"  Invested: {s.total_sol_invested:.4f} SOL | Budget: {budget_str}\n\n"
 
     return msg
 

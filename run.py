@@ -215,6 +215,18 @@ async def cmd_export_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                             caption="Trade history CSV")
 
 
+async def cmd_exportprices_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /exportprices — send price_data.csv as a file."""
+    import os
+    from pair_trader import PRICE_DATA_FILE
+    if not os.path.exists(PRICE_DATA_FILE):
+        await update.message.reply_text("No price data yet — start trading to collect data")
+        return
+    with open(PRICE_DATA_FILE, "rb") as f:
+        await update.message.reply_document(document=f, filename="price_data.csv",
+                                            caption="Price tick data CSV")
+
+
 # ============== BUTTON CALLBACK HANDLERS ==============
 
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -293,15 +305,22 @@ async def _handle_button(query, data):
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
     elif data == "pair_export":
-        import os
-        from pair_trader import TRADES_FILE
+        import os, csv as _csv
+        from pair_trader import TRADES_FILE, PRICE_DATA_FILE
+        lines = ["*EXPORT*\n"]
         if os.path.exists(TRADES_FILE):
-            import csv as _csv
             with open(TRADES_FILE) as f:
-                rows = list(_csv.DictReader(f))
-            msg = f"*EXPORT*\n\n{len(rows)} trades in pair_trades.csv\nSend /export to receive the file"
+                trades = list(_csv.DictReader(f))
+            lines.append(f"📄 *pair\_trades.csv* — {len(trades)} trades\n/export to receive")
         else:
-            msg = "*EXPORT*\n\nNo trades yet — pair_trades.csv doesn't exist"
+            lines.append("📄 *pair\_trades.csv* — no trades yet")
+        if os.path.exists(PRICE_DATA_FILE):
+            with open(PRICE_DATA_FILE) as f:
+                ticks = sum(1 for _ in f) - 1
+            lines.append(f"\n📈 *price\_data.csv* — {ticks} price ticks\n/exportprices to receive")
+        else:
+            lines.append("\n📈 *price\_data.csv* — no data yet")
+        msg = "\n".join(lines)
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
     elif data == "pair_help":
@@ -354,6 +373,7 @@ async def run_bot():
     app.add_handler(CommandHandler("rb", cmd_resetbudget_handler))
     app.add_handler(CommandHandler("closeall", cmd_closeall_handler))
     app.add_handler(CommandHandler("export", cmd_export_handler))
+    app.add_handler(CommandHandler("exportprices", cmd_exportprices_handler))
 
     # Button callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
