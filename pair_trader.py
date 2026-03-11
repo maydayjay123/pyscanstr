@@ -35,6 +35,10 @@ WALLET_UTILIZATION  = 0.85
 NUM_SLOTS           = 4
 DCA_SPLITS          = [0.15, 0.25, 0.60]   # step1 / step2 / step3
 DCA_CRASH_GUARD     = 2.0   # Skip DCA if price is more than 2× below trigger (crashed too hard)
+TRAIL_CONFIRM_TICKS = 2     # Require price below trail stop for N consecutive polls before selling
+WATCH_TIMEOUT_HOURS = 4     # Cancel watching slot if no entry after this many hours
+HOLD_ALERT_HOURS    = 72    # Send TG alert if position open this long with PnL < HOLD_ALERT_MIN_PNL
+HOLD_ALERT_MIN_PNL  = 15.0  # % — alert threshold for long holds
 
 SOL_MINT            = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -123,6 +127,7 @@ class PairSlot:
     max_pnl_pct: float        = 0.0
     trail_active: bool        = False
     peak_price: float         = 0.0  # highest price seen while open
+    trail_below_count: int    = 0    # consecutive ticks below trail stop (confirmation counter)
 
     # Timestamps
     entry_time: str           = ""
@@ -628,6 +633,17 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
 
     # ── WATCHING: waiting for entry dip ──────────────────────────────────
     if slot.status == "watching":
+        # Timeout: cancel slot if no entry after WATCH_TIMEOUT_HOURS
+        if slot.watch_time:
+            watch_age_hours = (datetime.now() - datetime.fromisoformat(slot.watch_time)).total_seconds() / 3600
+            if watch_age_hours >= WATCH_TIMEOUT_HOURS:
+                await notify(
+                    f"⏰ *Watch timed out* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                    f"No entry in {watch_age_hours:.1f}h — slot freed"
+                )
+                _reset_slot(slot)
+                return slot
+
         # Trail watch_price up with price — always measure dip from recent high
         if price_sol > slot.watch_price:
             slot.watch_price = price_sol
@@ -745,6 +761,18 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
                         f"PnL vs avg: {new_pnl:+.1f}%"
                     )
 
+        # ── Long hold alert ──
+        if slot.entry_time:
+            hold_hours = (datetime.now() - datetime.fromisoformat(slot.entry_time)).total_seconds() / 3600
+            # Alert once when crossing the threshold (use max_pnl as a proxy to avoid repeat alerts)
+            if hold_hours >= HOLD_ALERT_HOURS and pnl_pct < HOLD_ALERT_MIN_PNL and slot.max_pnl_pct < HOLD_ALERT_MIN_PNL + 1:
+                await notify(
+                    f"⏳ *Long hold alert* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                    f"Open {hold_hours:.0f}h | PnL: {pnl_pct:+.1f}% | Max: {slot.max_pnl_pct:+.1f}%\n"
+                    f"Consider /close to free up capital"
+                )
+                slot.max_pnl_pct = HOLD_ALERT_MIN_PNL + 1  # prevent repeat spam
+
         # ── Trailing TP ──
         activate_pct, trail_pct = get_trail_params(mc)
 
@@ -756,13 +784,18 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             trail_price = slot.peak_price * (1 - trail_pct / 100)
             if price_sol <= trail_price:
                 # No-loss guard: require at least +2% above avg before trail exits
-                # (buffers for slippage — actual SOL received may be slightly below price-implied PnL)
                 if slot.dca_avg_price > 0 and price_sol <= slot.dca_avg_price * 1.02:
-                    pass  # hold — not enough profit to cover slippage
+                    slot.trail_below_count = 0  # reset — below avg, not a valid exit
                 else:
-                    reason = f"TRAIL +{slot.max_pnl_pct:.1f}% trail={trail_pct:.0f}%"
-                    await _close_slot(slot, budget, wallet, price_sol, price_usd, reason)
-                    return slot
+                    # 2-tick confirmation: require N consecutive polls below stop before selling
+                    slot.trail_below_count += 1
+                    if slot.trail_below_count >= TRAIL_CONFIRM_TICKS:
+                        reason = f"TRAIL +{slot.max_pnl_pct:.1f}% trail={trail_pct:.0f}%"
+                        await _close_slot(slot, budget, wallet, price_sol, price_usd, reason)
+                        return slot
+            else:
+                # Price back above trail stop — reset confirmation counter
+                slot.trail_below_count = 0
 
     return slot
 
@@ -850,6 +883,7 @@ def _reset_slot(slot: PairSlot):
     slot.max_pnl_pct = 0.0
     slot.trail_active = False
     slot.peak_price = 0.0
+    slot.trail_below_count = 0
     slot.entry_time = ""
     slot.exit_time = ""
     slot.exit_price = 0.0
