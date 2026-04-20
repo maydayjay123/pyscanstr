@@ -634,6 +634,24 @@ async def cmd_nano_close(target: str) -> str:
     return f"Closed `{slot.symbol}` — check above for result"
 
 
+async def cmd_nano_watch() -> str:
+    watchlist = load_watchlist()
+    if not watchlist:
+        return "*NANO WATCHLIST*\n\n_Nothing being watched yet — scanner runs every 60s_"
+    lines = [f"*NANO WATCHLIST* ({len(watchlist)} tokens)\n"]
+    for w in watchlist:
+        age_m = int((datetime.now() - datetime.fromisoformat(w.first_seen_time)).total_seconds() / 60)
+        drop_needed = ((w.current_mc - ENTRY_MC) / w.current_mc * 100) if w.current_mc > ENTRY_MC else 0
+        time_ok = "✅" if age_m >= MIN_FALL_MINUTES else f"⏳{MIN_FALL_MINUTES - age_m}m"
+        lines.append(
+            f"• `{w.symbol}` — ${w.current_mc/1000:.0f}K MC "
+            f"(seen {age_m}m @ ${w.first_seen_mc/1000:.0f}K)\n"
+            f"  Needs −{drop_needed:.0f}% to entry | Time filter: {time_ok}\n"
+            f"  [chart](https://dexscreener.com/solana/{w.address})"
+        )
+    return "\n".join(lines)
+
+
 async def cmd_nano_cancel(symbol: str) -> str:
     watchlist = load_watchlist()
     before = len(watchlist)
@@ -669,12 +687,21 @@ async def run_nano_scanner(interval_secs: int = 60):
         try:
             if len(_shared_watchlist) < MAX_WATCHLIST:
                 new_items = await scan_new_pairs(_shared_watchlist)
-                if new_items:
-                    for item in new_items:
-                        if len(_shared_watchlist) < MAX_WATCHLIST:
-                            _shared_watchlist.append(item)
+                added = []
+                for item in new_items:
+                    if len(_shared_watchlist) < MAX_WATCHLIST:
+                        _shared_watchlist.append(item)
+                        added.append(item)
+                if added:
                     save_watchlist(_shared_watchlist)
                     print(f"[nano] Watchlist: {len(_shared_watchlist)} tokens")
+                    # Notify TG for each new pair added
+                    for item in added:
+                        await notify(
+                            f"👁 *New Pair Watching* `{item.symbol}`\n"
+                            f"MC: ${item.first_seen_mc/1000:.0f}K | Waiting for drop to ${ENTRY_MC/1000:.0f}K\n"
+                            f"[chart](https://dexscreener.com/solana/{item.address})"
+                        )
         except Exception as e:
             print(f"[nano] Scanner loop error: {e}")
         await asyncio.sleep(interval_secs)

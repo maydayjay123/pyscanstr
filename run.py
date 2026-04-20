@@ -590,6 +590,12 @@ async def nano_cmd_close(update, ctx):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def nano_cmd_watch(update, ctx):
+    from nano_trader import cmd_nano_watch
+    msg = await cmd_nano_watch()
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+
 async def nano_cmd_cancel(update, ctx):
     if not ctx.args:
         await update.message.reply_text("Usage: /cancel <symbol>")
@@ -621,7 +627,8 @@ async def nano_cmd_start(update, ctx):
         "*NANO TRADER*\n\n"
         "Auto-buys new pump.fun pairs at $10K MC.\n"
         "_3-step DCA | Fixed +88% TP | Rug-speed filter_\n\n"
-        "*/pos* — slots + watchlist\n"
+        "*/pos* — open slots + live PnL\n"
+        "*/watch* — full watchlist (tokens being tracked)\n"
         "*/stats* — budget & profit\n"
         "*/close <sym>* — manual sell\n"
         "*/cancel <sym>* — remove from watchlist\n"
@@ -644,6 +651,8 @@ async def run_nano_bot():
     app.add_handler(CH("start",       nano_cmd_start))
     app.add_handler(CH("pos",         nano_cmd_pos))
     app.add_handler(CH("p",           nano_cmd_pos))
+    app.add_handler(CH("watch",       nano_cmd_watch))
+    app.add_handler(CH("w",           nano_cmd_watch))
     app.add_handler(CH("stats",       nano_cmd_stats))
     app.add_handler(CH("close",       nano_cmd_close))
     app.add_handler(CH("cancel",      nano_cmd_cancel))
