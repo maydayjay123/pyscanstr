@@ -551,7 +551,7 @@ async def run_pair():
     print("=" * 50)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    print("Slots:    4 manual CA slots (85% wallet)")
+    print("Slots:    4 manual CA slots (50% wallet)")
     print("Trader:   30s check interval")
     print("Scanner:  data collection only (no auto-buys)")
     print()
@@ -567,12 +567,131 @@ async def run_pair():
     )
 
 
+# ============== NANO BOT COMMANDS ==============
+
+async def nano_cmd_pos(update, ctx):
+    from nano_trader import cmd_nano_pos
+    msg = await cmd_nano_pos()
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def nano_cmd_stats(update, ctx):
+    from nano_trader import cmd_nano_stats
+    msg = await cmd_nano_stats()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def nano_cmd_close(update, ctx):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /close <symbol> or /close <slot_number>")
+        return
+    from nano_trader import cmd_nano_close
+    msg = await cmd_nano_close(ctx.args[0])
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def nano_cmd_cancel(update, ctx):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /cancel <symbol>")
+        return
+    from nano_trader import cmd_nano_cancel
+    msg = await cmd_nano_cancel(ctx.args[0])
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def nano_cmd_resetbudget(update, ctx):
+    from nano_trader import cmd_nano_resetbudget
+    msg = await cmd_nano_resetbudget()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def nano_cmd_export(update, ctx):
+    import os
+    from nano_trader import NANO_TRADES_FILE
+    if not os.path.exists(NANO_TRADES_FILE):
+        await update.message.reply_text("No trades yet — nano_trades.csv doesn't exist")
+        return
+    with open(NANO_TRADES_FILE, "rb") as f:
+        await update.message.reply_document(document=f, filename="nano_trades.csv",
+                                            caption="Nano trade history CSV")
+
+
+async def nano_cmd_start(update, ctx):
+    msg = (
+        "*NANO TRADER*\n\n"
+        "Auto-buys new pump.fun pairs at $10K MC.\n"
+        "_3-step DCA | Fixed +88% TP | Rug-speed filter_\n\n"
+        "*/pos* — slots + watchlist\n"
+        "*/stats* — budget & profit\n"
+        "*/close <sym>* — manual sell\n"
+        "*/cancel <sym>* — remove from watchlist\n"
+        "*/resetbudget* — reinit budget\n"
+        "*/export* — get trades CSV\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def run_nano_bot():
+    """Run nano trader Telegram bot (separate key)."""
+    from config import NANO_BOT_TOKEN
+    from telegram.ext import Application, CommandHandler as CH
+
+    if not NANO_BOT_TOKEN:
+        print("[nano] No NANO_BOT_TOKEN set — TG bot disabled")
+        return
+
+    app = Application.builder().token(NANO_BOT_TOKEN).build()
+    app.add_handler(CH("start",       nano_cmd_start))
+    app.add_handler(CH("pos",         nano_cmd_pos))
+    app.add_handler(CH("p",           nano_cmd_pos))
+    app.add_handler(CH("stats",       nano_cmd_stats))
+    app.add_handler(CH("close",       nano_cmd_close))
+    app.add_handler(CH("cancel",      nano_cmd_cancel))
+    app.add_handler(CH("resetbudget", nano_cmd_resetbudget))
+    app.add_handler(CH("rb",          nano_cmd_resetbudget))
+    app.add_handler(CH("export",      nano_cmd_export))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("[nano] TG bot running")
+    while True:
+        await asyncio.sleep(60)
+
+
+async def run_nano():
+    """Run nano trader — automated new-pair DCA bot."""
+    from nano_trader import run_nano_trader, run_nano_scanner
+
+    print("=" * 50)
+    print("NANO TRADER MODE")
+    print("=" * 50)
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    print("Slots:    2 auto slots (35% wallet)")
+    print("Entry:    $10K MC | TP: +88% fixed")
+    print("DCA:      -50% / -80% from entry")
+    print("Filter:   ≥20 min fall (rug-speed check)")
+    print()
+    print("Commands: /pos  /stats  /close  /cancel  /export")
+    print("Ctrl+C to stop")
+    print("=" * 50)
+    print()
+
+    await asyncio.gather(
+        run_nano_trader(interval_secs=30),
+        run_nano_scanner(interval_secs=60),
+        run_nano_bot(),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meme Scanner + Sim/Live Manager")
     parser.add_argument("--scan", action="store_true", help="Run scanner only")
     parser.add_argument("--sim", action="store_true", help="Run sim manager only")
     parser.add_argument("--live", action="store_true", help="Run with LIVE trading")
     parser.add_argument("--pair", action="store_true", help="Run pair trader (manual CA trading)")
+    parser.add_argument("--nano", action="store_true", help="Run nano trader (auto new-pair DCA)")
     parser.add_argument("--reset", action="store_true", help="Reset all data")
     parser.add_argument("--reset-live", action="store_true", help="Reset live data only")
     parser.add_argument("--no-tg", action="store_true", help="Disable Telegram output")
@@ -596,6 +715,11 @@ def main():
             asyncio.run(run_pair())
         except KeyboardInterrupt:
             print("\nPair trader stopped")
+    elif args.nano:
+        try:
+            asyncio.run(run_nano())
+        except KeyboardInterrupt:
+            print("\nNano trader stopped")
     else:
         try:
             asyncio.run(run_all(no_tg=args.no_tg))

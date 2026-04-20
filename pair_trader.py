@@ -31,7 +31,7 @@ load_dotenv("keys.env")
 SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 MAX_SLIPPAGE_BPS    = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "15")) * 100)
 MIN_FEE_RESERVE     = float(os.getenv("MIN_FEE_RESERVE", "0.005"))
-WALLET_UTILIZATION  = 0.85
+WALLET_UTILIZATION  = 0.50   # 50% for pair trader; 35% reserved for nano trader
 NUM_SLOTS           = 4
 DCA_SPLITS          = [0.15, 0.25, 0.60]   # step1 / step2 / step3
 DCA_CRASH_GUARD     = 2.0   # Skip DCA if price is more than 2× below trigger (crashed too hard)

@@ -8,6 +8,10 @@ load_dotenv()
 # Telegram settings
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Nano trader — separate TG bot
+NANO_BOT_TOKEN = os.getenv("NANO_BOT_TOKEN", "")
+NANO_CHAT_ID   = os.getenv("NANO_CHAT_ID", "")
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "7"))  # 7 AM daily digest
 
 # Scraping settings
