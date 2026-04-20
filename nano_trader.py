@@ -259,8 +259,32 @@ def _log_nano_trade(slot: NanoSlot, profit_sol: float):
 
 
 # ─────────────────────────────────────────
-# Price + liquidity fetch
+# Price + liquidity fetch (cached SOL price)
 # ─────────────────────────────────────────
+
+_sol_usd_cache: float = 0.0
+_sol_usd_last_fetch: float = 0.0
+_SOL_CACHE_TTL = 120  # refresh SOL/USD price every 2 minutes
+
+
+async def _get_sol_usd() -> float:
+    global _sol_usd_cache, _sol_usd_last_fetch
+    import time
+    if time.time() - _sol_usd_last_fetch < _SOL_CACHE_TTL and _sol_usd_cache > 0:
+        return _sol_usd_cache
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                data = await r.json()
+                _sol_usd_cache = float(data.get("solana", {}).get("usd", 0) or 0)
+                _sol_usd_last_fetch = time.time()
+    except:
+        pass
+    return _sol_usd_cache
+
 
 async def get_nano_token_data(address: str) -> tuple:
     """Returns (price_sol, price_usd, mc_usd, liquidity_usd) from DexScreener."""
@@ -272,7 +296,6 @@ async def get_nano_token_data(address: str) -> tuple:
                 pairs = data.get("pairs") or []
                 if not pairs:
                     return 0.0, 0.0, 0.0, 0.0
-                # Pick highest-liquidity Solana pair
                 sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
                 if not sol_pairs:
                     return 0.0, 0.0, 0.0, 0.0
@@ -281,19 +304,7 @@ async def get_nano_token_data(address: str) -> tuple:
                 price_usd = float(pair.get("priceUsd", 0) or 0)
                 mc = float(pair.get("marketCap", 0) or 0)
                 liquidity = float(pair.get("liquidity", {}).get("usd", 0) or 0)
-
-                # Convert price to SOL
-                sol_usd = 0.0
-                try:
-                    async with session.get(
-                        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
-                        timeout=aiohttp.ClientTimeout(total=5)
-                    ) as r:
-                        cg = await r.json()
-                        sol_usd = float(cg.get("solana", {}).get("usd", 0) or 0)
-                except:
-                    pass
-
+                sol_usd = await _get_sol_usd()
                 price_sol = price_usd / sol_usd if sol_usd > 0 else 0.0
                 return price_sol, price_usd, mc, liquidity
     except:
@@ -413,26 +424,31 @@ def _time_factor_ok(watch: NanoWatch) -> tuple:
 
 
 async def scan_new_pairs(watchlist: list) -> list:
-    """Fetch new pump.fun tokens and add qualifying ones to watchlist."""
+    """Find recently bonded Solana tokens via DexScreener token profiles.
+    These are post-bond tokens that have actual DEX pairs — the ones we want to watch."""
     watched = {w.address for w in watchlist}
     new_items = []
 
     try:
         async with aiohttp.ClientSession() as session:
-            url = (
-                "https://frontend-api.pump.fun/coins"
-                "?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false"
-            )
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # DexScreener token profiles = recently added/bonded tokens
+            async with session.get(
+                "https://api.dexscreener.com/token-profiles/latest/v1",
+                timeout=aiohttp.ClientTimeout(total=12)
+            ) as resp:
                 if resp.status != 200:
+                    print(f"[nano] DexScreener profiles returned {resp.status}")
                     return []
-                coins = await resp.json()
+                profiles = await resp.json()
 
-            if not isinstance(coins, list):
+            if not isinstance(profiles, list):
                 return []
 
-            for coin in coins[:30]:
-                addr = coin.get("mint", "")
+            sol_profiles = [p for p in profiles if p.get("chainId") == "solana"]
+            print(f"[nano] Scanning {len(sol_profiles)} new Solana token profiles...")
+
+            for profile in sol_profiles[:40]:
+                addr = profile.get("tokenAddress", "")
                 if not addr or addr in watched:
                     continue
 
@@ -441,19 +457,23 @@ async def scan_new_pairs(watchlist: list) -> list:
                     await asyncio.sleep(0.1)
                     continue
 
+                symbol = profile.get("header", addr[:8])[:10]
+
                 if WATCH_MC_MIN <= mc <= WATCH_MC_MAX and liquidity >= MIN_LIQUIDITY_ENTRY:
                     item = NanoWatch(
                         address=addr,
-                        symbol=coin.get("symbol", "?")[:10],
+                        symbol=symbol,
                         first_seen_mc=mc,
                         first_seen_time=datetime.now().isoformat(),
                         current_mc=mc,
                     )
                     new_items.append(item)
                     watched.add(addr)
-                    print(f"[nano] Watching {item.symbol} @ ${mc/1000:.0f}K MC")
+                    print(f"[nano] Watching {symbol} @ ${mc/1000:.0f}K MC (liq: ${liquidity/1000:.0f}K)")
+                else:
+                    print(f"[nano] Skip {symbol}: MC=${mc/1000:.0f}K liq=${liquidity/1000:.0f}K")
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.15)
 
     except Exception as e:
         print(f"[nano] scan_new_pairs error: {e}")
