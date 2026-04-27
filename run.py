@@ -22,29 +22,28 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # ============== MENU BUTTONS ==============
 
 def get_main_menu():
-    """Main menu — pair trader."""
     keyboard = [
         [
             InlineKeyboardButton("📊 Slots", callback_data="pair_positions"),
-            InlineKeyboardButton("📈 Stats", callback_data="pair_stats"),
+            InlineKeyboardButton("💰 Wallet", callback_data="pair_wallet"),
         ],
         [
-            InlineKeyboardButton("💰 Wallet", callback_data="pair_wallet"),
+            InlineKeyboardButton("📈 Stats", callback_data="pair_stats"),
             InlineKeyboardButton("📜 History", callback_data="pair_history"),
         ],
         [
             InlineKeyboardButton("📥 Export CSV", callback_data="pair_export"),
-            InlineKeyboardButton("ℹ️ Commands", callback_data="pair_help"),
+            InlineKeyboardButton("ℹ️ Help", callback_data="pair_help"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_position_menu():
-    """Slot view refresh button."""
     keyboard = [
         [
             InlineKeyboardButton("🔄 Refresh", callback_data="pair_positions"),
+            InlineKeyboardButton("💰 Wallet", callback_data="pair_wallet"),
             InlineKeyboardButton("🏠 Menu", callback_data="menu"),
         ],
     ]
@@ -52,7 +51,6 @@ def get_position_menu():
 
 
 def get_back_menu():
-    """Simple back to menu button."""
     keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data="menu")]]
     return InlineKeyboardMarkup(keyboard)
 
@@ -62,14 +60,16 @@ def get_back_menu():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - show main menu."""
     msg = (
-        "*PAIR TRADER*\n\n"
-        "4 manual slots — you pick the CA, bot handles the rest.\n"
-        "_Trail TP is dynamic to token MC. Never exits at a loss._\n\n"
-        "*/trade <CA>* — start watching a token\n"
-        "*/cancel <sym>* — cancel before entry\n"
-        "*/close <sym>* — manually sell\n"
-        "*/pos* — slot status\n"
-        "*/stats* — budgets & profit\n"
+        "*PAIR TRADER — 8 SLOTS*\n\n"
+        "You pick the CA, bot handles entry, DCA & exit.\n"
+        "_Trail TP by MC tier. Auto-buys after 4h watch. No-loss guard._\n\n"
+        "*/trade <CA>* — watch a token\n"
+        "*/cancel <sym|slot>* — cancel watching\n"
+        "*/close <sym|slot>* — force sell now\n"
+        "*/closeall* — close every position\n"
+        "*/pos* — all slot status (live PnL)\n"
+        "*/stats* — budgets & profit per slot\n"
+        "*/export* — get trade history CSV\n"
     )
     await update.message.reply_text(
         msg,
@@ -326,18 +326,21 @@ async def _handle_button(query, data):
     elif data == "pair_help":
         msg = (
             "*COMMANDS*\n\n"
-            "*/trade <CA>* — watch token, auto-enter on dip\n"
-            "*/cancel <sym>* — cancel before entry\n"
-            "*/close <sym>* — manually sell now\n"
-            "*/pos* — slot status + live PnL\n"
-            "*/stats* — budgets & profit per slot\n\n"
+            "*/trade <CA>* — start watching a token\n"
+            "*/cancel <sym|slot>* — cancel before entry\n"
+            "*/close <sym|slot>* — force sell now\n"
+            "*/closeall* — close all open positions\n"
+            "*/pos* — all slots, live PnL\n"
+            "*/stats* — budget & profit per slot\n"
+            "*/resetbudget* — reinit budgets from wallet\n"
+            "*/export* — download trade CSV\n\n"
             "*How it works:*\n"
-            "1. Send /trade with a contract address\n"
-            "2. Bot watches price, waits for MC-based dip\n"
-            "3. Buys Step 1 (15%) on dip\n"
-            "4. Step 2 (25%) and Step 3 (60%) auto-buy on deeper dips\n"
-            "5. Trail TP: dynamic by MC (8-15% activate, 3-6% trail)\n"
-            "6. On close → auto re-watches same token"
+            "1. Send /trade <CA> — bot watches price\n"
+            "2. Waits for MC-based dip, then buys Step 1 (15%)\n"
+            "3. If no dip after 4h → auto-buys at market\n"
+            "4. Step 2 (25%) at −8% | Step 3 (60%) at −14%\n"
+            "5. Trail TP activates +8–15% (by MC), trails 3–6% below peak\n"
+            "6. Close → auto re-watches same token"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
 
@@ -551,7 +554,7 @@ async def run_pair():
     print("=" * 50)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    print("Slots:    4 manual CA slots (50% wallet)")
+    print("Slots:    8 manual CA slots (85% wallet)")
     print("Trader:   30s check interval")
     print("Scanner:  data collection only (no auto-buys)")
     print()

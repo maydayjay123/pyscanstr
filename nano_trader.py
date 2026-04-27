@@ -39,7 +39,7 @@ from pair_trader import (
 # ─────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────
-NANO_UTILIZATION    = 0.35
+NANO_UTILIZATION    = 0.0    # disabled — pair trader using full 85%
 NUM_NANO_SLOTS      = 2
 DCA_SPLITS          = [0.15, 0.25, 0.60]
 

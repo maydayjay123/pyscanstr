@@ -31,14 +31,14 @@ load_dotenv("keys.env")
 SOLANA_RPC_URL      = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 MAX_SLIPPAGE_BPS    = int(float(os.getenv("MAX_SLIPPAGE_PERCENT", "15")) * 100)
 MIN_FEE_RESERVE     = float(os.getenv("MIN_FEE_RESERVE", "0.005"))
-WALLET_UTILIZATION  = 0.50   # 50% for pair trader; 35% reserved for nano trader
-NUM_SLOTS           = 4
-DCA_SPLITS          = [0.15, 0.25, 0.60]   # step1 / step2 / step3
-DCA_CRASH_GUARD     = 2.0   # Skip DCA if price is more than 2× below trigger (crashed too hard)
-TRAIL_CONFIRM_TICKS = 2     # Require price below trail stop for N consecutive polls before selling
-WATCH_TIMEOUT_HOURS = 4     # Cancel watching slot if no entry after this many hours
-HOLD_ALERT_HOURS    = 72    # Send TG alert if position open this long with PnL < HOLD_ALERT_MIN_PNL
-HOLD_ALERT_MIN_PNL  = 15.0  # % — alert threshold for long holds
+WALLET_UTILIZATION   = 0.85
+NUM_SLOTS            = 8
+DCA_SPLITS           = [0.15, 0.25, 0.60]   # step1 / step2 / step3
+DCA_CRASH_GUARD      = 2.0   # Skip DCA if price is more than 2× below trigger (crashed too hard)
+TRAIL_CONFIRM_TICKS  = 2     # Require price below trail stop for N consecutive polls before selling
+WATCH_AUTOBUY_HOURS  = 4     # Auto-buy at market after this many hours of watching with no dip entry
+HOLD_ALERT_HOURS     = 72    # Send TG alert if position open this long with PnL < HOLD_ALERT_MIN_PNL
+HOLD_ALERT_MIN_PNL   = 15.0  # % — alert threshold for long holds
 
 SOL_MINT            = "So11111111111111111111111111111111111111112"
 SPL_TOKEN_PROGRAM   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -633,23 +633,19 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
 
     # ── WATCHING: waiting for entry dip ──────────────────────────────────
     if slot.status == "watching":
-        # Timeout: cancel slot if no entry after WATCH_TIMEOUT_HOURS
+        # Auto-buy at market after WATCH_AUTOBUY_HOURS with no dip entry
+        autobuy_triggered = False
         if slot.watch_time:
             watch_age_hours = (datetime.now() - datetime.fromisoformat(slot.watch_time)).total_seconds() / 3600
-            if watch_age_hours >= WATCH_TIMEOUT_HOURS:
-                await notify(
-                    f"⏰ *Watch timed out* `{slot.symbol}` [Slot {slot.slot_id}]\n"
-                    f"No entry in {watch_age_hours:.1f}h — slot freed"
-                )
-                _reset_slot(slot)
-                return slot
+            if watch_age_hours >= WATCH_AUTOBUY_HOURS:
+                autobuy_triggered = True
 
         # Trail watch_price up with price — always measure dip from recent high
         if price_sol > slot.watch_price:
             slot.watch_price = price_sol
 
         dip_from_watch = ((slot.watch_price - price_sol) / slot.watch_price) * 100
-        if dip_from_watch >= slot.entry_dip_pct:
+        if dip_from_watch >= slot.entry_dip_pct or autobuy_triggered:
             # Entry condition met — buy Step 1
             step1_sol = budget.budget_sol * DCA_SPLITS[0]
             tx, tokens = await buy_tokens(step1_sol, slot.token_address, wallet)
@@ -673,11 +669,15 @@ async def process_slot(slot: PairSlot, budget: SlotBudget, wallet: str) -> PairS
             slot.status         = "open"
 
             act_pct, tr_pct = get_trail_params(mc)
+            entry_type = "⏰ AUTO-BUY (4h timeout)" if autobuy_triggered else f"✅ DIP ENTRY (-{dip_from_watch:.1f}%)"
             await notify(
-                f"✅ *ENTERED* `{slot.symbol}` [Slot {slot.slot_id}]\n"
-                f"Step 1 @ ${price_usd:.6f} ({step1_sol:.4f} SOL)\n"
-                f"Step 2 @ -{step2_drop:.0f}%  |  Step 3 @ -{step3_drop:.0f}%\n"
-                f"Trail: activates +{act_pct:.0f}%, sits {tr_pct:.0f}% below peak"
+                f"🟢 *ENTERED* `{slot.symbol}` [Slot {slot.slot_id}]\n"
+                f"{entry_type}\n"
+                f"Step 1 @ ${price_usd:.6f} | {step1_sol:.4f} SOL\n"
+                f"MC: ${mc/1000:.0f}K\n"
+                f"DCA2 @ −{step2_drop:.0f}% | DCA3 @ −{step3_drop:.0f}%\n"
+                f"Trail: +{act_pct:.0f}% activate, {tr_pct:.0f}% trail\n"
+                f"[chart](https://dexscreener.com/solana/{slot.token_address})"
             )
         return slot
 
@@ -998,76 +998,80 @@ async def cmd_close(symbol_or_slot: str) -> str:
 
 
 async def cmd_positions() -> str:
-    """Return rich formatted positions with live prices and all targets."""
+    """Dashboard view — all 8 slots at a glance with full detail on active ones."""
     slots = load_slots()
     budgets = load_budgets() or []
     budget_map = {b.slot_id: b for b in budgets}
 
+    # ── Slot overview bar ──
+    overview = []
+    for s in slots:
+        if s.status == "empty":
+            overview.append(f"⚪ S{s.slot_id}")
+        elif s.status == "watching":
+            overview.append(f"👀 S{s.slot_id}")
+        else:
+            overview.append(f"🔵 S{s.slot_id}")
+    msg = "*PAIR TRADER*\n"
+    msg += "  ".join(overview[:4]) + "\n"
+    msg += "  ".join(overview[4:]) + "\n\n"
+
     active = [s for s in slots if s.status in ("watching", "open")]
     if not active:
-        return "*No active slots*\nUse /trade <CA> to start"
+        msg += "_All slots empty — use /trade <CA> to start_"
+        return msg
 
-    msg = "*SLOTS*\n\n"
     for s in active:
         b = budget_map.get(s.slot_id)
-        budget_str = f"{b.budget_sol:.4f} SOL" if b else "?"
-
         price_sol, price_usd, mc = await get_token_price_and_mc(s.token_address)
         usd_ratio = (price_usd / price_sol) if price_sol > 0 else 0.0
 
         if s.status == "watching":
-            target_sol = s.watch_price * (1 - s.entry_dip_pct / 100)
-            target_usd = target_sol * usd_ratio
+            current_dip = ((s.watch_price - price_sol) / s.watch_price * 100
+                           if price_sol > 0 and s.watch_price > 0 else 0.0)
+            still_needed = max(0.0, s.entry_dip_pct - current_dip)
+            watch_age_h = ((datetime.now() - datetime.fromisoformat(s.watch_time)).total_seconds() / 3600
+                           if s.watch_time else 0)
+            autobuy_in = max(0, WATCH_AUTOBUY_HOURS - watch_age_h)
 
-            if price_sol > 0 and s.watch_price > 0:
-                current_dip = ((s.watch_price - price_sol) / s.watch_price) * 100
-                still_needed = max(0.0, s.entry_dip_pct - current_dip)
-                msg += f"*Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
-                msg += f"  Live:   ${price_usd:.8f}\n"
-                msg += f"  Entry target: ${target_usd:.8f} (-{s.entry_dip_pct:.1f}% from high)\n"
-                if still_needed > 0.05:
-                    msg += f"  Dip so far: {current_dip:.1f}% | Still need: {still_needed:.1f}%\n"
-                else:
-                    msg += f"  Dip so far: {current_dip:.1f}% — *near entry!*\n"
+            msg += f"👀 *Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
+            msg += f"  Price: ${price_usd:.8f}\n"
+            if still_needed > 0.05:
+                msg += f"  Entry dip: need −{s.entry_dip_pct:.1f}% | so far −{current_dip:.1f}% | {still_needed:.1f}% to go\n"
             else:
-                msg += f"*Slot {s.slot_id} — WATCHING* `{s.symbol}`\n"
-                msg += f"  Entry target: -{s.entry_dip_pct:.1f}% dip | price unavailable\n"
-            msg += f"  Budget: {budget_str}\n\n"
+                msg += f"  ⚡ *Near entry!* Dip: −{current_dip:.1f}%\n"
+            msg += f"  Auto-buy in: {autobuy_in:.1f}h | Budget: {b.budget_sol:.4f} SOL\n\n"
 
         elif s.status == "open":
-            pnl = ((price_sol - s.dca_avg_price) / s.dca_avg_price) * 100 \
-                  if price_sol > 0 and s.dca_avg_price > 0 else 0.0
-            avg_usd  = s.dca_avg_price * usd_ratio
-            mc_use   = s.entry_mc if s.entry_mc > 0 else mc
-            activate_pct, trail_pct = get_trail_params(mc_use)
+            pnl = ((price_sol - s.dca_avg_price) / s.dca_avg_price * 100
+                   if price_sol > 0 and s.dca_avg_price > 0 else 0.0)
+            mc_use = s.entry_mc if s.entry_mc > 0 else mc
+            act_pct, trail_pct = get_trail_params(mc_use)
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
 
-            msg += f"*Slot {s.slot_id} — OPEN* `{s.symbol}` [step {s.dca_step}/3]\n"
-            msg += f"  Live: ${price_usd:.8f} | Avg: ${avg_usd:.8f}\n"
-            msg += f"  PnL: *{pnl:+.1f}%* | Max: {s.max_pnl_pct:+.1f}%\n"
+            hold_h = ((datetime.now() - datetime.fromisoformat(s.entry_time)).total_seconds() / 3600
+                      if s.entry_time else 0)
 
-            # DCA targets still pending
-            if s.dca_step == 1:
-                msg += f"  Step 2 target: ${s.step2_price * usd_ratio:.8f} (-8% from entry)\n"
-                msg += f"  Step 3 target: ${s.step3_price * usd_ratio:.8f} (-14% from entry)\n"
-            elif s.dca_step == 2:
-                msg += f"  Step 3 target: ${s.step3_price * usd_ratio:.8f} (-14% from entry)\n"
-            else:
-                msg += f"  Fully invested (all 3 steps)\n"
+            msg += f"{pnl_emoji} *Slot {s.slot_id} — OPEN* `{s.symbol}` [step {s.dca_step}/3]\n"
+            msg += f"  PnL: *{pnl:+.1f}%* | Max: {s.max_pnl_pct:+.1f}% | Hold: {hold_h:.1f}h\n"
+            msg += f"  Live: ${price_usd:.8f} | Avg: ${s.dca_avg_price * usd_ratio:.8f}\n"
 
-            # Trail status
+            if s.dca_step < 3:
+                next_step = s.step2_price if s.dca_step == 1 else s.step3_price
+                step_num = 2 if s.dca_step == 1 else 3
+                drop_needed = ((price_sol - next_step) / price_sol * 100) if price_sol > 0 else 0
+                msg += f"  DCA{step_num}: ${next_step * usd_ratio:.8f} ({drop_needed:.1f}% below)\n"
+
             if s.trail_active:
-                trail_stop_sol = s.peak_price * (1 - trail_pct / 100)
-                trail_stop_usd = trail_stop_sol * usd_ratio
-                peak_usd = s.peak_price * usd_ratio
-                msg += f"  Trail: *ACTIVE* | Stop ${trail_stop_usd:.8f} ({trail_pct:.0f}% below peak ${peak_usd:.8f})\n"
+                stop = s.peak_price * (1 - trail_pct / 100)
+                msg += f"  Trail: 🔴 ACTIVE | Stop ${stop * usd_ratio:.8f} ({trail_pct:.0f}% off peak)\n"
             else:
-                trail_trigger_sol = s.dca_avg_price * (1 + activate_pct / 100)
-                trail_trigger_usd = trail_trigger_sol * usd_ratio
-                msg += f"  Trail activates at +{activate_pct:.0f}% → ${trail_trigger_usd:.8f}\n"
+                trigger = s.dca_avg_price * (1 + act_pct / 100)
+                msg += f"  Trail: activates at +{act_pct:.0f}% = ${trigger * usd_ratio:.8f}\n"
 
-            msg += f"  Invested: {s.total_sol_invested:.4f} SOL | Budget: {budget_str}\n\n"
+            msg += f"  Invested: {s.total_sol_invested:.4f} SOL\n\n"
 
-    return msg
+    return msg.strip()
 
 
 async def cmd_closeall() -> str:
