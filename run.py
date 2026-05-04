@@ -39,14 +39,44 @@ def get_main_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_position_menu():
-    keyboard = [
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="pair_positions"),
-            InlineKeyboardButton("💰 Wallet", callback_data="pair_wallet"),
-            InlineKeyboardButton("🏠 Menu", callback_data="menu"),
-        ],
-    ]
+def get_position_menu(slots=None):
+    """Position view with per-slot close/cancel buttons."""
+    keyboard = []
+
+    if slots:
+        open_slots    = [s for s in slots if s.status == "open"]
+        watching_slots = [s for s in slots if s.status == "watching"]
+
+        # Close buttons for open slots (2 per row)
+        if open_slots:
+            row = []
+            for s in open_slots:
+                row.append(InlineKeyboardButton(
+                    f"🔴 Close S{s.slot_id} {s.symbol}", callback_data=f"close_slot_{s.slot_id}"
+                ))
+                if len(row) == 2:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+
+        # Cancel buttons for watching slots (2 per row)
+        if watching_slots:
+            row = []
+            for s in watching_slots:
+                row.append(InlineKeyboardButton(
+                    f"❌ Cancel S{s.slot_id} {s.symbol}", callback_data=f"cancel_slot_{s.slot_id}"
+                ))
+                if len(row) == 2:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="pair_positions"),
+        InlineKeyboardButton("🏠 Menu", callback_data="menu"),
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -175,10 +205,10 @@ async def cmd_close_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_positions_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /pos — show pair trader slot status."""
-    from pair_trader import cmd_positions
+    from pair_trader import cmd_positions, load_slots
+    slots = load_slots()
     msg = await cmd_positions()
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_position_menu(slots))
 
 
 async def cmd_stats_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -262,8 +292,10 @@ async def _handle_button(query, data):
 
     elif data == "pair_positions":
         from pair_trader import cmd_positions
+        from pair_trader import load_slots
+        slots = load_slots()
         msg = await cmd_positions()
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_position_menu())
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_position_menu(slots))
 
     elif data == "pair_stats":
         from pair_trader import cmd_stats
@@ -351,6 +383,29 @@ async def _handle_button(query, data):
             "6. Close → auto re-watches same token"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_back_menu())
+
+    elif data.startswith("close_slot_"):
+        slot_id = data.split("_")[-1]
+        from pair_trader import cmd_close, load_slots
+        await query.edit_message_text(f"⏳ Closing slot {slot_id}...", parse_mode="Markdown")
+        msg = await cmd_close(slot_id)
+        slots = load_slots()
+        pos_msg = await cmd_positions()
+        await query.edit_message_text(
+            f"{msg}\n\n{pos_msg}", parse_mode="Markdown",
+            reply_markup=get_position_menu(slots)
+        )
+
+    elif data.startswith("cancel_slot_"):
+        slot_id = data.split("_")[-1]
+        from pair_trader import cmd_cancel, load_slots
+        msg = await cmd_cancel(slot_id)
+        slots = load_slots()
+        pos_msg = await cmd_positions()
+        await query.edit_message_text(
+            f"{msg}\n\n{pos_msg}", parse_mode="Markdown",
+            reply_markup=get_position_menu(slots)
+        )
 
 
 # ============== BOT RUNNER ==============
