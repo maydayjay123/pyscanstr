@@ -49,6 +49,28 @@ BUDGETS_FILE        = "slot_budgets.json"
 PAIR_HISTORY_FILE   = "pair_history.json"
 TRADES_FILE         = "pair_trades.csv"
 PRICE_DATA_FILE     = "price_data.csv"
+PAIR_CONFIG_FILE    = "pair_config.json"
+
+
+def get_num_slots() -> int:
+    """Read NUM_SLOTS from pair_config.json (falls back to hardcoded default)."""
+    try:
+        with open(PAIR_CONFIG_FILE) as f:
+            return int(json.load(f).get("num_slots", NUM_SLOTS))
+    except:
+        return NUM_SLOTS
+
+
+def set_num_slots(n: int):
+    cfg = {}
+    try:
+        with open(PAIR_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except:
+        pass
+    cfg["num_slots"] = n
+    with open(PAIR_CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 
 # ─────────────────────────────────────────
@@ -145,21 +167,21 @@ class PairSlot:
 # ─────────────────────────────────────────
 
 def load_slots() -> list:
+    n = get_num_slots()
     if not os.path.exists(SLOTS_FILE):
-        return [PairSlot(slot_id=i, status="empty") for i in range(1, NUM_SLOTS + 1)]
+        return [PairSlot(slot_id=i, status="empty") for i in range(1, n + 1)]
     try:
         with open(SLOTS_FILE) as f:
             raw = json.load(f)
         slots = [PairSlot(**s) for s in raw]
-        # If NUM_SLOTS increased, add the missing empty slots
         existing_ids = {s.slot_id for s in slots}
-        for i in range(1, NUM_SLOTS + 1):
+        for i in range(1, n + 1):
             if i not in existing_ids:
                 slots.append(PairSlot(slot_id=i, status="empty"))
         slots.sort(key=lambda s: s.slot_id)
         return slots
     except:
-        return [PairSlot(slot_id=i, status="empty") for i in range(1, NUM_SLOTS + 1)]
+        return [PairSlot(slot_id=i, status="empty") for i in range(1, n + 1)]
 
 
 def save_slots(slots: list):
@@ -214,13 +236,14 @@ async def init_budgets() -> list:
     wallet = get_wallet_pubkey()
     sol = await get_sol_balance(wallet) if wallet else 0.0
     usable = max(0.0, sol - MIN_FEE_RESERVE)
-    per_slot = (usable * WALLET_UTILIZATION) / NUM_SLOTS
+    n = get_num_slots()
+    per_slot = (usable * WALLET_UTILIZATION) / n
     budgets = [
         SlotBudget(slot_id=i, budget_sol=per_slot, start_budget_sol=per_slot)
-        for i in range(1, NUM_SLOTS + 1)
+        for i in range(1, n + 1)
     ]
     save_budgets(budgets)
-    print(f"Budgets initialised: {per_slot:.4f} SOL per slot (wallet: {sol:.4f} SOL)")
+    print(f"Budgets initialised: {per_slot:.4f} SOL per slot × {n} slots (wallet: {sol:.4f} SOL)")
     return budgets
 
 
@@ -1110,8 +1133,39 @@ async def cmd_resetbudget() -> str:
         return "Reset failed — wallet not configured"
     global _BUDGETS_CACHE
     _BUDGETS_CACHE = budgets
+    n = get_num_slots()
     lines = [f"Slot {b.slot_id}: {b.budget_sol:.4f} SOL" for b in budgets]
-    return "Budget reset from wallet:\n" + "\n".join(lines)
+    return f"Budget reset — {n} slots:\n" + "\n".join(lines)
+
+
+async def cmd_setslots(n_str: str) -> str:
+    """Change number of slots and recalculate budgets. /setslots <number>"""
+    try:
+        n = int(n_str.strip())
+    except:
+        return "Usage: /setslots <number>  e.g. /setslots 6"
+
+    if n < 1 or n > 20:
+        return "Slot count must be between 1 and 20"
+
+    # Warn if reducing below active slot count
+    slots = load_slots()
+    active_above = [s for s in slots if s.slot_id > n and s.status != "empty"]
+    if active_above:
+        syms = ", ".join(f"S{s.slot_id} {s.symbol}" for s in active_above)
+        return f"Cannot reduce to {n} — active positions above that: {syms}\nClose them first then retry."
+
+    set_num_slots(n)
+
+    import os as _os
+    if _os.path.exists(BUDGETS_FILE):
+        _os.remove(BUDGETS_FILE)
+    budgets = await init_budgets()
+    global _BUDGETS_CACHE
+    _BUDGETS_CACHE = budgets
+
+    per = budgets[0].budget_sol if budgets else 0
+    return f"Slots set to {n} — budget recalculated\n{n} × {per:.4f} SOL per slot"
 
 
 async def cmd_stats() -> str:

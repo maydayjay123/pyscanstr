@@ -189,9 +189,17 @@ async def cmd_stats_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_resetbudget_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /resetbudget — re-init slot budgets from current wallet balance."""
     from pair_trader import cmd_resetbudget
     msg = await cmd_resetbudget()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_setslots_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /setslots <number>  e.g. /setslots 6")
+        return
+    from pair_trader import cmd_setslots
+    msg = await cmd_setslots(ctx.args[0])
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -373,7 +381,8 @@ async def run_bot():
     app.add_handler(CommandHandler("p", cmd_positions_pair))
     app.add_handler(CommandHandler("stats", cmd_stats_pair))
     app.add_handler(CommandHandler("resetbudget", cmd_resetbudget_handler))
-    app.add_handler(CommandHandler("rb", cmd_resetbudget_handler))
+    app.add_handler(CommandHandler("rb",          cmd_resetbudget_handler))
+    app.add_handler(CommandHandler("setslots",    cmd_setslots_handler))
     app.add_handler(CommandHandler("closeall", cmd_closeall_handler))
     app.add_handler(CommandHandler("export", cmd_export_handler))
     app.add_handler(CommandHandler("exportprices", cmd_exportprices_handler))
