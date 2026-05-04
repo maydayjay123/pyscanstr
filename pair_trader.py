@@ -1148,12 +1148,12 @@ async def cmd_setslots(n_str: str) -> str:
     if n < 1 or n > 20:
         return "Slot count must be between 1 and 20"
 
-    # Warn if reducing below active slot count
+    # Block only if active position COUNT exceeds new slot count
     slots = load_slots()
-    active_above = [s for s in slots if s.slot_id > n and s.status != "empty"]
-    if active_above:
-        syms = ", ".join(f"S{s.slot_id} {s.symbol}" for s in active_above)
-        return f"Cannot reduce to {n} — active positions above that: {syms}\nClose them first then retry."
+    all_active = [s for s in slots if s.status != "empty"]
+    if len(all_active) > n:
+        syms = ", ".join(f"S{s.slot_id} {s.symbol}" for s in all_active)
+        return f"Cannot reduce to {n} — you have {len(all_active)} active positions: {syms}\nClose {len(all_active) - n} first then retry."
 
     set_num_slots(n)
 
