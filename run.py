@@ -224,6 +224,12 @@ async def cmd_resetbudget_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_devbal_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from devnet_collector import cmd_balance
+    msg = await cmd_balance()
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 async def cmd_setslots_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: /setslots <number>  e.g. /setslots 6")
@@ -441,6 +447,7 @@ async def run_bot():
     app.add_handler(CommandHandler("closeall", cmd_closeall_handler))
     app.add_handler(CommandHandler("export", cmd_export_handler))
     app.add_handler(CommandHandler("exportprices", cmd_exportprices_handler))
+    app.add_handler(CommandHandler("devbal", cmd_devbal_handler))
 
     # Button callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
