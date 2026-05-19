@@ -8,9 +8,31 @@ Usage: python devnet_collector.py
 import asyncio
 import aiohttp
 import json
+import socket
 from datetime import datetime
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+try:
+    from aiohttp_socks import ProxyConnector
+    TOR_AVAILABLE = True
+except ImportError:
+    TOR_AVAILABLE = False
+
+TOR_PROXY    = "socks5://127.0.0.1:9050"
+TOR_CONTROL  = ("127.0.0.1", 9051)  # Tor control port for new circuit
+
+
+def _new_tor_circuit():
+    """Signal Tor to get a new exit IP."""
+    try:
+        s = socket.socket()
+        s.connect(TOR_CONTROL)
+        s.send(b"AUTHENTICATE \"\"\r\nSIGNAL NEWNYM\r\nQUIT\r\n")
+        s.close()
+        return True
+    except:
+        return False
 
 WALLET       = "3taTiQLc2NQQPQAjt2MurGNGekReHs3KgXaTkjCqZGJh"
 DEVNET_RPCS  = [
@@ -58,33 +80,36 @@ async def get_balance() -> float:
 
 
 async def request_airdrop() -> tuple:
-    """Returns (success: bool, message: str)"""
-    try:
-        async with aiohttp.ClientSession() as s:
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "requestAirdrop",
-                "params": [WALLET, LAMPORTS]
-            }
-            async with s.post(DEVNET_RPC, json=payload,
-                              timeout=aiohttp.ClientTimeout(total=15)) as r:
-                data = await r.json()
+    """Returns (success: bool, message: str). Routes through Tor if available."""
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "requestAirdrop",
+        "params": [WALLET, LAMPORTS]
+    }
 
-                if "result" in data:
-                    sig = data["result"]
-                    return True, f"tx: `{sig[:20]}...`"
+    for rpc in DEVNET_RPCS:
+        try:
+            # Use Tor if available, otherwise direct
+            if TOR_AVAILABLE:
+                connector = ProxyConnector.from_url(TOR_PROXY)
+                session_ctx = aiohttp.ClientSession(connector=connector)
+            else:
+                session_ctx = aiohttp.ClientSession()
 
-                err = data.get("error", {})
-                code = err.get("code", "?")
-                msg  = err.get("message", "unknown error")
+            async with session_ctx as s:
+                async with s.post(rpc, json=payload,
+                                  timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    data = await r.json()
+                    if "result" in data:
+                        via = " (Tor)" if TOR_AVAILABLE else ""
+                        return True, f"tx: `{data['result'][:20]}...`{via}"
+                    err = data.get("error", {})
+                    print(f"    [{rpc.split('/')[2]}] {err.get('code')} {err.get('message','')}")
+        except Exception as e:
+            print(f"    [{rpc.split('/')[2]}] {e}")
+        continue
 
-                # Rate limited — try alternative faucets
-                if code == 429 or "limit" in str(msg).lower():
-                    return await _try_alt_faucet()
-
-                return False, f"Error {code}: {msg}"
-    except Exception as e:
-        return False, f"Request failed: {e}"
+    return False, "All endpoints failed — faucet down or rate limited"
 
 
 async def _try_alt_faucet() -> tuple:
@@ -125,6 +150,9 @@ async def run_cycle(cycle_num: int):
         print(f"  {status} {msg}")
 
         if drop_num < DROPS_PER_CYCLE:
+            if TOR_AVAILABLE:
+                rotated = _new_tor_circuit()
+                print(f"  [Tor] Circuit rotation {'OK' if rotated else 'failed'}, waiting {DROP_GAP_SECS}s...")
             await asyncio.sleep(DROP_GAP_SECS)
 
     await asyncio.sleep(5)  # let chain settle
