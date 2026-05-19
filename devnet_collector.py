@@ -15,7 +15,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 WALLET       = "3taTiQLc2NQQPQAjt2MurGNGekReHs3KgXaTkjCqZGJh"
 DEVNET_RPC   = "https://api.devnet.solana.com"
 DROPS_PER_CYCLE = 2
-SOL_PER_DROP    = 5          # SOL requested per airdrop
+SOL_PER_DROP    = 2          # SOL requested per airdrop
 LAMPORTS        = SOL_PER_DROP * 1_000_000_000
 CYCLE_HOURS     = 8          # wait between cycles
 DROP_GAP_SECS   = 30         # gap between the 2 drops in same cycle
