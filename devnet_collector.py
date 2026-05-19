@@ -13,7 +13,11 @@ from datetime import datetime
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 WALLET       = "3taTiQLc2NQQPQAjt2MurGNGekReHs3KgXaTkjCqZGJh"
-DEVNET_RPC   = "https://api.devnet.solana.com"
+DEVNET_RPCS  = [
+    "https://api.devnet.solana.com",
+    "https://rpc.ankr.com/solana_devnet",
+]
+DEVNET_RPC   = DEVNET_RPCS[0]
 DROPS_PER_CYCLE = 2
 SOL_PER_DROP    = 1          # SOL requested per airdrop (2 was rejected, trying 1)
 LAMPORTS        = SOL_PER_DROP * 1_000_000_000
@@ -84,24 +88,25 @@ async def request_airdrop() -> tuple:
 
 
 async def _try_alt_faucet() -> tuple:
-    """Fallback: retry main RPC with smaller amounts."""
-    for lamports in [1_000_000_000, 500_000_000]:  # 1 SOL, 0.5 SOL
-        try:
-            async with aiohttp.ClientSession() as s:
-                payload = {
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "requestAirdrop",
-                    "params": [WALLET, lamports]
-                }
-                async with s.post(DEVNET_RPC, json=payload,
-                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    data = await r.json()
-                    if "result" in data:
-                        sol = lamports / 1_000_000_000
-                        return True, f"{sol} SOL via fallback"
-        except:
-            continue
-    return False, "All attempts failed — faucet may be down"
+    """Fallback: try all RPC endpoints with smaller amounts."""
+    for rpc in DEVNET_RPCS:
+        for lamports in [1_000_000_000, 500_000_000]:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    payload = {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "requestAirdrop",
+                        "params": [WALLET, lamports]
+                    }
+                    async with s.post(rpc, json=payload,
+                                      timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        data = await r.json()
+                        if "result" in data:
+                            sol = lamports / 1_000_000_000
+                            return True, f"{sol} SOL ({rpc.split('/')[2]})"
+            except:
+                continue
+    return False, "All endpoints failed — faucet may be down"
 
 
 async def run_cycle(cycle_num: int):
