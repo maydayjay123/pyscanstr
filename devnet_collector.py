@@ -37,7 +37,7 @@ def _new_tor_circuit():
 WALLET       = "3taTiQLc2NQQPQAjt2MurGNGekReHs3KgXaTkjCqZGJh"
 DEVNET_RPCS  = [
     "https://api.devnet.solana.com",
-    "https://rpc.ankr.com/solana_devnet",
+    "https://rpc.devnet.soo.network/rpc",
 ]
 DEVNET_RPC   = DEVNET_RPCS[0]
 DROPS_PER_CYCLE = 2
