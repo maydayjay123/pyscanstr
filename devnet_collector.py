@@ -15,7 +15,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 WALLET       = "3taTiQLc2NQQPQAjt2MurGNGekReHs3KgXaTkjCqZGJh"
 DEVNET_RPC   = "https://api.devnet.solana.com"
 DROPS_PER_CYCLE = 2
-SOL_PER_DROP    = 2          # SOL requested per airdrop
+SOL_PER_DROP    = 1          # SOL requested per airdrop (2 was rejected, trying 1)
 LAMPORTS        = SOL_PER_DROP * 1_000_000_000
 CYCLE_HOURS     = 8          # wait between cycles
 DROP_GAP_SECS   = 30         # gap between the 2 drops in same cycle
@@ -84,27 +84,24 @@ async def request_airdrop() -> tuple:
 
 
 async def _try_alt_faucet() -> tuple:
-    """Fallback to alternative devnet faucets."""
-    endpoints = [
-        {
-            "url": "https://faucet.triangleplatform.com/solana/devnet",
-            "method": "POST",
-            "json": {"address": WALLET},
-        },
-    ]
-    for ep in endpoints:
+    """Fallback: retry main RPC with smaller amounts."""
+    for lamports in [1_000_000_000, 500_000_000]:  # 1 SOL, 0.5 SOL
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    ep["url"], json=ep["json"],
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    text = await r.text()
-                    if r.status == 200:
-                        return True, f"alt faucet: {text[:60]}"
+                payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "requestAirdrop",
+                    "params": [WALLET, lamports]
+                }
+                async with s.post(DEVNET_RPC, json=payload,
+                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+                    if "result" in data:
+                        sol = lamports / 1_000_000_000
+                        return True, f"{sol} SOL via fallback"
         except:
             continue
-    return False, "Rate limited — all faucets failed"
+    return False, "All attempts failed — faucet may be down"
 
 
 async def run_cycle(cycle_num: int):
